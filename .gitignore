@@ -1,0 +1,46 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build output
+/bin/
+/build/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Test video files
+test/input/*.MP4
+test/input/*.mp4
+test/output/*.mp4
+test/output/**/*.mp4
+
+# Logs
+*.log
