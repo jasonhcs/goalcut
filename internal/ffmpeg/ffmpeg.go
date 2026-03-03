@@ -155,7 +155,8 @@ func (f *FFmpeg) CutClip(inputPath string, outputPath string, startSec, endSec f
 		"-c:v", "libx264",
 		"-preset", "fast",
 		"-crf", "23",
-		"-an",
+		"-c:a", "aac",
+		"-b:a", "128k",
 		"-y",
 		outputPath,
 	)
@@ -193,6 +194,8 @@ func (f *FFmpeg) ConcatClips(clipPaths []string, outputPath string) error {
 		"-c:v", "libx264",
 		"-preset", "fast",
 		"-crf", "23",
+		"-c:a", "aac",
+		"-b:a", "128k",
 		"-y",
 		outputPath,
 	)

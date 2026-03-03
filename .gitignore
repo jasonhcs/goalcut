@@ -4,6 +4,8 @@
 *.dll
 *.so
 *.dylib
+*.mp4
+*.MP4
 
 # Go build output
 /bin/

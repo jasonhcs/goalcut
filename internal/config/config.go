@@ -39,13 +39,13 @@ func DefaultConfig() *Config {
 		},
 		Detection: DetectionConfig{
 			SampleFPS:           3,
-			ConfidenceThreshold: 0.3,
-			YOLOConfidence:      0.3,
+			ConfidenceThreshold: 0.55,
+			YOLOConfidence:      0.25,
 			PythonPath:          "python3",
 		},
 		Highlight: HighlightConfig{
 			BeforeSeconds:  3,
-			AfterSeconds:   3,
+			AfterSeconds:   1,
 			MergeThreshold: 4,
 		},
 	}

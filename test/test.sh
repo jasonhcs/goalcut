@@ -1,14 +1,15 @@
 #!/bin/bash
 #
 # GoalCut 集成测试脚本
-# 用法: cd goalcut && bash test/test.sh
+# 用法: cd goalcut && bash test/test.sh [输入目录或文件]
+# 默认输入源: test/input 目录
 #
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-INPUT_DIR="$SCRIPT_DIR/input"
+INPUT_DIR="${1:-$SCRIPT_DIR/input}"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
 # 颜色输出
@@ -126,33 +127,35 @@ for input_file in "$INPUT_DIR"/*.MP4 "$INPUT_DIR"/*.mp4; do
 done
 
 # ============================================
-# 测试 2: 单文件处理（可选）
+# 测试 2: 单文件处理（可选，传 --single 启用）
 # ============================================
-FIRST_VIDEO=$(find "$INPUT_DIR" -maxdepth 1 -type f -iname "*.mp4" | head -1)
-if [ -n "$FIRST_VIDEO" ]; then
-    echo ""
-    echo -e "${YELLOW}=========================================="
-    echo "  测试 2: 单文件处理（验证默认输出路径）"
-    echo -e "==========================================${NC}"
+if [ "${SINGLE_TEST:-0}" = "1" ]; then
+    FIRST_VIDEO=$(find "$INPUT_DIR" -maxdepth 1 -type f -iname "*.mp4" | head -1)
+    if [ -n "$FIRST_VIDEO" ]; then
+        echo ""
+        echo -e "${YELLOW}=========================================="
+        echo "  测试 2: 单文件处理（验证默认输出路径）"
+        echo -e "==========================================${NC}"
 
-    SINGLE_OUTPUT="$OUTPUT_DIR/single_test"
-    mkdir -p "$SINGLE_OUTPUT"
+        SINGLE_OUTPUT="$OUTPUT_DIR/single_test"
+        mkdir -p "$SINGLE_OUTPUT"
 
-    go run cmd/goalcut/main.go \
-        -input "$FIRST_VIDEO" \
-        -output "$SINGLE_OUTPUT/" \
-        2>&1 | tail -5
+        go run cmd/goalcut/main.go \
+            -input "$FIRST_VIDEO" \
+            -output "$SINGLE_OUTPUT/" \
+            2>&1 | tail -5
 
-    base_name=$(basename "$FIRST_VIDEO")
-    name_no_ext="${base_name%.*}"
-    single_expected="$SINGLE_OUTPUT/${name_no_ext}_goalcut.mp4"
+        base_name=$(basename "$FIRST_VIDEO")
+        name_no_ext="${base_name%.*}"
+        single_expected="$SINGLE_OUTPUT/${name_no_ext}_goalcut.mp4"
 
-    if [ -f "$single_expected" ]; then
-        echo -e "  ${GREEN}✅ 单文件输出正确: $single_expected${NC}"
-        PASS_COUNT=$((PASS_COUNT + 1))
-    else
-        echo -e "  ${RED}❌ 单文件输出缺失: $single_expected${NC}"
-        FAIL_COUNT=$((FAIL_COUNT + 1))
+        if [ -f "$single_expected" ]; then
+            echo -e "  ${GREEN}✅ 单文件输出正确: $single_expected${NC}"
+            PASS_COUNT=$((PASS_COUNT + 1))
+        else
+            echo -e "  ${RED}❌ 单文件输出缺失: $single_expected${NC}"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
     fi
 fi
 

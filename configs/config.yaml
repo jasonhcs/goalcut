@@ -7,9 +7,9 @@ detection:
   # 采样帧率（每秒提取帧数）
   sample_fps: 3
   # 进球置信度阈值
-  confidence_threshold: 0.3
+  confidence_threshold: 0.55
   # YOLO 检测置信度
-  yolo_confidence: 0.3
+  yolo_confidence: 0.25
   # Python 解释器路径
   python_path: "/opt/miniconda3/bin/python3"
 
@@ -17,6 +17,6 @@ highlight:
   # 进球前截取秒数
   before_seconds: 3
   # 进球后截取秒数
-  after_seconds: 3
+  after_seconds: 1
   # 相邻事件合并阈值（秒）
   merge_threshold: 4
