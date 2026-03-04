@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-GoalCut AI 进球检测引擎 v2.1
+GoalCut AI 进球检测引擎 v2.2
 
-Phase 1.5 重构版本，核心改进：
+Phase 1.5 P2 增强版本，新增：
+- 篮网形变检测（光流法，net_deform.py，通道 4）
+- 入网声/哨声检测（audio_detect.py，通道 5）
+- 两阶段采样策略（粗扫定位候选区间，精扫几何判定，--two-stage）
+
+v2.1 已有：
 - 动态篮筐检测（替代硬编码 ROI）
 - IOU 追踪器建立球体轨迹
 - 基于空间几何的进球判定（替代启发式规则）
 - 冷静期机制防止重复计数
 - 多通道并行检测：YOLO球体 + 人体运动 + 帧差分运动
-- 保留三层回退兼容（YOLO+追踪 → 启发式 → 帧差分）
 """
 
 import argparse
@@ -675,15 +679,81 @@ def detect_goals_by_motion(frame_files: List[str], img_w: int, img_h: int,
 # 主检测流程
 # ============================================================
 
+def two_stage_filter_frames(frame_files: List[str], sample_fps: float,
+                             rough_events: List[Dict],
+                             window_s: float = 4.0) -> List[str]:
+    """
+    两阶段采样 - 阶段2：根据粗扫候选区间筛选精扫帧。
+
+    在每个候选事件前后 window_s 秒范围内保留全部帧；
+    其余区域跳过（已在阶段1粗扫过）。
+
+    Args:
+        frame_files:   全部帧（按顺序）
+        sample_fps:    帧率
+        rough_events:  阶段1候选事件列表
+        window_s:      候选事件前后保留范围（秒）
+
+    Returns:
+        精扫帧文件列表（比全量少，聚焦候选区间）
+    """
+    if not rough_events:
+        return frame_files
+
+    # 建立候选区间集合（帧索引范围）
+    candidate_ranges = []
+    for ev in rough_events:
+        t = ev["timestamp"]
+        start_f = max(0, int((t - window_s) * sample_fps))
+        end_f = int((t + window_s) * sample_fps) + 1
+        candidate_ranges.append((start_f, end_f))
+
+    # 合并重叠区间
+    candidate_ranges.sort()
+    merged = [candidate_ranges[0]]
+    for s, e in candidate_ranges[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    # 筛选帧
+    fine_frames = []
+    for i, path in enumerate(frame_files):
+        for s, e in merged:
+            if s <= i <= e:
+                fine_frames.append(path)
+                break
+
+    log(f"两阶段采样: 全量 {len(frame_files)} 帧 → 精扫 {len(fine_frames)} 帧 "
+        f"(节省 {100*(1-len(fine_frames)/max(1,len(frame_files))):.0f}%)")
+    return fine_frames
+
+
 def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
-                 yolo_confidence, video_duration):
-    """主检测流程 v2.1 - 多通道并行检测"""
-    log(f"开始进球检测 (v2.1)")
+                 yolo_confidence, video_duration,
+                 audio_file=None, enable_net_deform=False, two_stage=False,
+                 enabled_channels=None):
+    """主检测流程 v2.3 - 多通道并行检测（含篮网形变 + 音频 + 通道选择）
+    
+    Args:
+        enabled_channels: 指定要运行的通道集合，如 {"1a","2","5"}。None=全部。
+    """
+    log(f"开始进球检测 (v2.3)")
     log(f"  帧目录: {frames_dir}")
     log(f"  采样帧率: {sample_fps}")
     log(f"  置信度阈值: {confidence_threshold}")
     log(f"  YOLO置信度: {yolo_confidence}")
     log(f"  视频时长: {video_duration}s")
+    log(f"  音频文件: {audio_file or '未提供'}")
+    log(f"  篮网形变检测: {'启用' if enable_net_deform else '禁用'}")
+    log(f"  两阶段采样: {'启用' if two_stage else '禁用'}")
+    if enabled_channels:
+        log(f"  通道过滤: 仅运行 {sorted(enabled_channels)}")
+
+    def ch_enabled(ch_name):
+        """检查通道是否启用"""
+        return enabled_channels is None or ch_name in enabled_channels
 
     # 加载 YOLO 模型
     log("加载 YOLOv8 模型...")
@@ -709,6 +779,14 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
 
     log(f"共 {len(frame_files)} 帧待检测")
 
+    # 两阶段采样：阶段1 使用稀疏帧（每隔1帧，约1.5fps）快速粗扫
+    if two_stage and len(frame_files) > 20:
+        log("--- 两阶段采样: 阶段1 粗扫（每隔1帧）---")
+        rough_frames = frame_files[::2]  # 每隔1帧取1帧，~1.5fps
+        log(f"  粗扫帧数: {len(rough_frames)} / {len(frame_files)}")
+    else:
+        rough_frames = frame_files
+
     # 获取图像尺寸
     import cv2
     sample_img = cv2.imread(frame_files[0])
@@ -723,36 +801,47 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
     BALL_CLASS = 32  # sports ball
 
     # ================================================================
-    # 通道 1: YOLO 球体检测（使用较低阈值捕获更多）
+    # 通道 1: YOLO 球体检测（阶段1使用粗扫帧，阶段2精扫候选区间）
     # ================================================================
-    log("--- 通道 1: YOLO 球体检测 ---")
+    need_ball = ch_enabled("1a") or ch_enabled("1b")
     ball_yolo_conf = min(yolo_confidence, 0.25)  # 降低阈值
     ball_detections = []  # [(frame_idx, cx, cy, w, h, conf)]
+    frame_path_to_idx = {path: i for i, path in enumerate(frame_files)}
 
-    for i, frame_path in enumerate(frame_files):
-        if i % 10 == 0:
-            log(f"检测进度: {i+1}/{len(frame_files)}")
+    if need_ball:
+        log("--- 通道 1: YOLO 球体检测 ---")
 
-        try:
-            results = model(frame_path, conf=ball_yolo_conf, verbose=False)
-            for r in results:
-                if r.boxes is None:
-                    continue
-                for box in r.boxes:
-                    cls = int(box.cls[0])
-                    if cls == BALL_CLASS:
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        cx = (x1 + x2) / 2
-                        cy = (y1 + y2) / 2
-                        w = x2 - x1
-                        h = y2 - y1
-                        conf = float(box.conf[0])
-                        ball_detections.append((i, cx, cy, w, h, conf))
-        except Exception as e:
-            log(f"帧 {i} 检测异常: {e}")
-            continue
+        # 两阶段时，先用粗扫帧；否则用全量帧
+        detect_frames = rough_frames if two_stage else frame_files
 
-    log(f"通道1: 共检测到 {len(ball_detections)} 次球体出现")
+        for frame_path in detect_frames:
+            # 获取原始帧索引（保证时间戳计算正确）
+            i = frame_path_to_idx.get(frame_path, 0)
+            if i % 10 == 0:
+                log(f"检测进度: {i+1}/{len(frame_files)}")
+
+            try:
+                results = model(frame_path, conf=ball_yolo_conf, verbose=False)
+                for r in results:
+                    if r.boxes is None:
+                        continue
+                    for box in r.boxes:
+                        cls = int(box.cls[0])
+                        if cls == BALL_CLASS:
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+                            cx = (x1 + x2) / 2
+                            cy = (y1 + y2) / 2
+                            w = x2 - x1
+                            h = y2 - y1
+                            conf = float(box.conf[0])
+                            ball_detections.append((i, cx, cy, w, h, conf))
+            except Exception as e:
+                log(f"帧 {i} 检测异常: {e}")
+                continue
+
+        log(f"通道1: 共检测到 {len(ball_detections)} 次球体出现")
+    else:
+        log("--- 通道 1: YOLO 球体检测 (已跳过) ---")
 
     # ---- 动态篮筐检测 ----
     log("开始动态篮筐检测...")
@@ -771,7 +860,7 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
     all_candidate_events = []
 
     # ---- 通道 1a: IOU 追踪 + 几何判定 ----
-    if ball_detections:
+    if ball_detections and ch_enabled("1a"):
         log("--- 通道 1a: IOU 追踪 + 几何判定 ---")
         from tracker import IOUTracker, Detection as TrackerDetection
 
@@ -822,32 +911,145 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
         log(f"通道1a 几何判定: {len(all_candidate_events)} 个候选")
 
         # ---- 通道 1b: 改进版启发式 ----
-        log("--- 通道 1b: 启发式检测 ---")
-        heuristic_events = fallback_heuristic_v2(
-            frame_balls, img_w, img_h, total_frames,
-            sample_fps, video_duration, hoop_y_min, hoop_y_max,
-            confidence_threshold
+        if ch_enabled("1b"):
+            log("--- 通道 1b: 启发式检测 ---")
+            heuristic_events = fallback_heuristic_v2(
+                frame_balls, img_w, img_h, total_frames,
+                sample_fps, video_duration, hoop_y_min, hoop_y_max,
+                confidence_threshold
+            )
+            all_candidate_events.extend(heuristic_events)
+            log(f"通道1b 启发式: {len(heuristic_events)} 个候选")
+
+    # ================================================================
+    # 两阶段采样阶段2: 若粗扫已找到候选，对候选区间进行精扫补充 ball 检测
+    # ================================================================
+    if two_stage and all_candidate_events and len(rough_frames) < len(frame_files):
+        log("--- 两阶段采样: 阶段2 精扫候选区间 ---")
+        fine_for_ball = two_stage_filter_frames(
+            frame_files, sample_fps, all_candidate_events, window_s=4.0
         )
-        all_candidate_events.extend(heuristic_events)
-        log(f"通道1b 启发式: {len(heuristic_events)} 个候选")
+        # 只扫描粗扫没覆盖的帧
+        rough_set = set(rough_frames)
+        extra_frames = [f for f in fine_for_ball if f not in rough_set]
+        if extra_frames:
+            log(f"  精扫额外帧: {len(extra_frames)} 帧")
+            for frame_path in extra_frames:
+                i = frame_path_to_idx.get(frame_path, 0)
+                try:
+                    results = model(frame_path, conf=ball_yolo_conf, verbose=False)
+                    for r in results:
+                        if r.boxes is None:
+                            continue
+                        for box in r.boxes:
+                            cls = int(box.cls[0])
+                            if cls == BALL_CLASS:
+                                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                cx_b = (x1 + x2) / 2
+                                cy_b = (y1 + y2) / 2
+                                w_b = x2 - x1
+                                h_b = y2 - y1
+                                conf_b = float(box.conf[0])
+                                ball_detections.append((i, cx_b, cy_b, w_b, h_b, conf_b))
+                except Exception:
+                    pass
+            # 用新的 ball_detections 重新追踪
+            if extra_frames:
+                log("  重新运行追踪 + 几何判定...")
+                from tracker import IOUTracker, Detection as TrackerDetection
+                frame_dets2 = {}
+                frame_balls2 = {}
+                for (fidx, cx, cy, w, h, conf) in ball_detections:
+                    if fidx not in frame_dets2:
+                        frame_dets2[fidx] = []
+                        frame_balls2[fidx] = []
+                    frame_dets2[fidx].append(TrackerDetection(fidx, cx, cy, w, h, conf))
+                    frame_balls2[fidx].append((cx, cy, w, h, conf))
+                tracker2 = IOUTracker(
+                    iou_threshold=0.15,
+                    max_lost=max(3, int(sample_fps * 1.5)),
+                    distance_threshold=max(50, min(img_w, img_h) * 0.15),
+                )
+                for fidx in range(len(frame_files)):
+                    tracker2.update(frame_dets2.get(fidx, []))
+                for track in tracker2.get_all_tracks():
+                    pts = [(p.frame_idx, p.cx, p.cy, p.conf) for p in track.points]
+                    event = judge_goal_by_trajectory(
+                        pts, hoop_cx, hoop_cy, hoop_w, hoop_h, sample_fps)
+                    if event:
+                        all_candidate_events.append(event)
 
     # ================================================================
     # 通道 2: 人体运动模式检测（不依赖球体）
     # ================================================================
-    log("--- 通道 2: 人体运动模式检测 ---")
-    person_events = detect_goals_by_person_motion(
-        frame_files, model, img_w, img_h, sample_fps, yolo_confidence
-    )
-    all_candidate_events.extend(person_events)
+    if ch_enabled("2"):
+        log("--- 通道 2: 人体运动模式检测 ---")
+        # 两阶段时用粗扫帧做人体检测（速度优先）
+        person_events = detect_goals_by_person_motion(
+            rough_frames if two_stage else frame_files,
+            model, img_w, img_h, sample_fps, yolo_confidence
+        )
+        all_candidate_events.extend(person_events)
+    else:
+        log("--- 通道 2: 人体运动模式检测 (已跳过) ---")
 
     # ================================================================
     # 通道 3: 局部运动突变检测（不依赖 YOLO）
     # ================================================================
-    log("--- 通道 3: 局部运动突变检测 ---")
-    motion_events = detect_goals_by_motion(
-        frame_files, img_w, img_h, sample_fps, video_duration
-    )
-    all_candidate_events.extend(motion_events)
+    if ch_enabled("3"):
+        log("--- 通道 3: 局部运动突变检测 ---")
+
+        # 两阶段采样：先用粗扫帧（每隔1帧）找候选，再精扫候选区间
+        fine_frame_files = frame_files
+        if two_stage and all_candidate_events:
+            log("--- 两阶段采样: 基于已有候选区间精扫 ---")
+            fine_frame_files = two_stage_filter_frames(
+                frame_files, sample_fps, all_candidate_events, window_s=4.0
+            )
+
+        motion_events = detect_goals_by_motion(
+            fine_frame_files, img_w, img_h, sample_fps, video_duration
+        )
+        all_candidate_events.extend(motion_events)
+    else:
+        log("--- 通道 3: 局部运动突变检测 (已跳过) ---")
+        fine_frame_files = frame_files
+
+    # ================================================================
+    # 通道 4: 篮网形变检测（光流法）
+    # ================================================================
+    if enable_net_deform and ch_enabled("4"):
+        log("--- 通道 4: 篮网形变检测 ---")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from net_deform import detect_net_deformation
+            net_events = detect_net_deformation(
+                fine_frame_files, hoop_cx, hoop_cy, hoop_w,
+                sample_fps=sample_fps,
+                cooldown_s=3.0,
+            )
+            all_candidate_events.extend(net_events)
+            log(f"通道4 篮网形变: {len(net_events)} 个候选")
+        except Exception as e:
+            log(f"通道4 篮网形变检测失败（跳过）: {e}")
+    else:
+        log("--- 通道 4: 篮网形变检测 (已禁用，传 --enable-net-deform 启用) ---")
+
+    # ================================================================
+    # 通道 5: 音频事件检测（入网声 + 哨声）
+    # ================================================================
+    if audio_file and os.path.exists(audio_file) and ch_enabled("5"):
+        log(f"--- 通道 5: 音频事件检测 ({audio_file}) ---")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from audio_detect import detect_audio_events
+            audio_events = detect_audio_events(audio_file, video_duration)
+            all_candidate_events.extend(audio_events)
+            log(f"通道5 音频检测: {len(audio_events)} 个候选")
+        except Exception as e:
+            log(f"通道5 音频检测失败（跳过）: {e}")
+    else:
+        log("--- 通道 5: 音频检测 (未提供音频文件，传 --audio-file 启用) ---")
 
     # ================================================================
     # 汇总所有通道结果 + 跨通道验证
@@ -1125,7 +1327,7 @@ def save_results(events, output_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GoalCut AI 进球检测引擎 v2.1")
+    parser = argparse.ArgumentParser(description="GoalCut AI 进球检测引擎 v2.2")
     parser.add_argument("--frames-dir", required=True, help="帧图片目录")
     parser.add_argument("--output", required=True, help="检测结果输出路径(JSON)")
     parser.add_argument("--sample-fps", type=float, default=3, help="采样帧率")
@@ -1135,8 +1337,24 @@ def main():
                         help="YOLO检测置信度")
     parser.add_argument("--video-duration", type=float, default=0,
                         help="视频时长(秒)")
+    # v2.2 新增参数
+    parser.add_argument("--audio-file", default="",
+                        help="提取的音频 WAV 文件路径（启用音频检测通道）")
+    parser.add_argument("--enable-net-deform", action="store_true",
+                        help="启用篮网形变检测（光流法，需要 OpenCV）")
+    parser.add_argument("--two-stage", action="store_true",
+                        help="启用两阶段采样（粗扫候选区间后精扫，提升时间精度）")
+    # v2.3 通道选择
+    parser.add_argument("--channel", default="",
+                        help="只运行指定通道（逗号分隔），如: 1a,2,5。空=全部")
 
     args = parser.parse_args()
+
+    # 解析通道过滤
+    enabled_channels = None
+    if args.channel:
+        enabled_channels = set(c.strip() for c in args.channel.split(","))
+        log(f"仅运行通道: {enabled_channels}")
 
     detect_goals(
         frames_dir=args.frames_dir,
@@ -1145,6 +1363,10 @@ def main():
         confidence_threshold=args.confidence_threshold,
         yolo_confidence=args.yolo_confidence,
         video_duration=args.video_duration,
+        audio_file=args.audio_file if args.audio_file else None,
+        enable_net_deform=args.enable_net_deform,
+        two_stage=args.two_stage,
+        enabled_channels=enabled_channels,
     )
 
 

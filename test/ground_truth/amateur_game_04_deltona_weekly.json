@@ -1,0 +1,27 @@
+{
+  "video": "amateur_game_04_deltona_weekly.mp4",
+  "duration": 480.080998,
+  "total_goals": 5,
+  "goals": [
+    {
+      "timestamp": 41.0,
+      "note": "faqiu1"
+    },
+    {
+      "timestamp": 52.0,
+      "note": "faqiu2"
+    },
+    {
+      "timestamp": 102.0,
+      "note": "lanxia1"
+    },
+    {
+      "timestamp": 125.0,
+      "note": "2fen1"
+    },
+    {
+      "timestamp": 199.0,
+      "note": "lanxia2"
+    }
+  ]
+}

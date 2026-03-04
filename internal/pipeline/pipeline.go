@@ -59,8 +59,8 @@ func (p *Pipeline) Run(inputPath, outputPath string) error {
 		return fmt.Errorf("无法获取视频时长")
 	}
 
-	// 2. 提取帧
-	fmt.Println("\n[pipeline] === 步骤 2/5: 提取视频帧 ===")
+	// 2. 提取帧 + 音频
+	fmt.Println("\n[pipeline] === 步骤 2/5: 提取视频帧和音频 ===")
 	p.tempDir, err = os.MkdirTemp("", "goalcut-*")
 	if err != nil {
 		return fmt.Errorf("创建临时目录失败: %w", err)
@@ -79,9 +79,22 @@ func (p *Pipeline) Run(inputPath, outputPath string) error {
 		return fmt.Errorf("未提取到任何帧")
 	}
 
+	// 提取音频（失败不阻断主流程）
+	audioPath := filepath.Join(p.tempDir, "audio.wav")
+	if err := p.ff.ExtractAudio(inputPath, audioPath); err != nil {
+		fmt.Printf("[pipeline] 音频提取出错（继续）: %v\n", err)
+		audioPath = ""
+	}
+	// 若提取后文件不存在，置空路径
+	if audioPath != "" {
+		if _, statErr := os.Stat(audioPath); os.IsNotExist(statErr) {
+			audioPath = ""
+		}
+	}
+
 	// 3. AI 检测进球
 	fmt.Println("\n[pipeline] === 步骤 3/5: AI 视觉检测进球 ===")
-	events, err := p.detectGoals(framesDir, frameCount, info.Duration)
+	events, err := p.detectGoals(framesDir, frameCount, info.Duration, audioPath)
 	if err != nil {
 		return fmt.Errorf("AI 检测失败: %w", err)
 	}
@@ -143,7 +156,8 @@ func (p *Pipeline) Run(inputPath, outputPath string) error {
 }
 
 // detectGoals 调用 Python AI 脚本检测进球
-func (p *Pipeline) detectGoals(framesDir string, frameCount int, duration float64) ([]GoalEvent, error) {
+// audioPath 为空字符串时不启用音频检测通道
+func (p *Pipeline) detectGoals(framesDir string, frameCount int, duration float64, audioPath string) ([]GoalEvent, error) {
 	// 获取 ai-engine 脚本路径
 	exePath, err := os.Executable()
 	if err != nil {
@@ -163,15 +177,26 @@ func (p *Pipeline) detectGoals(framesDir string, frameCount int, duration float6
 	fmt.Printf("[pipeline] 调用 Python AI 检测: %s\n", scriptPath)
 	fmt.Printf("[pipeline] Python: %s\n", p.cfg.Detection.PythonPath)
 	fmt.Printf("[pipeline] 帧目录: %s, 帧数: %d\n", framesDir, frameCount)
+	if audioPath != "" {
+		fmt.Printf("[pipeline] 音频文件: %s (音频检测通道已启用)\n", audioPath)
+	}
 
-	cmd := exec.Command(p.cfg.Detection.PythonPath, scriptPath,
+	args := []string{
+		scriptPath,
 		"--frames-dir", framesDir,
 		"--output", resultPath,
 		"--sample-fps", fmt.Sprintf("%.2f", p.cfg.Detection.SampleFPS),
 		"--confidence-threshold", fmt.Sprintf("%.2f", p.cfg.Detection.ConfidenceThreshold),
 		"--yolo-confidence", fmt.Sprintf("%.2f", p.cfg.Detection.YOLOConfidence),
 		"--video-duration", fmt.Sprintf("%.2f", duration),
-	)
+		"--two-stage",        // 默认启用两阶段采样
+		"--enable-net-deform", // 默认启用篮网形变检测
+	}
+	if audioPath != "" {
+		args = append(args, "--audio-file", audioPath)
+	}
+
+	cmd := exec.Command(p.cfg.Detection.PythonPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

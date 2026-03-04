@@ -206,3 +206,40 @@ func (f *FFmpeg) ConcatClips(clipPaths []string, outputPath string) error {
 	fmt.Printf("[ffmpeg] 拼接完成: %s\n", outputPath)
 	return nil
 }
+
+// ExtractAudio 从视频中提取单声道 WAV 音频（用于音频检测通道）。
+// 提取 16kHz 单声道，如果视频无音轨则静默返回 nil。
+func (f *FFmpeg) ExtractAudio(videoPath string, outputWav string) error {
+	fmt.Printf("[ffmpeg] 提取音频: %s → %s\n", videoPath, outputWav)
+
+	if err := os.MkdirAll(filepath.Dir(outputWav), 0755); err != nil {
+		return fmt.Errorf("创建音频输出目录失败: %w", err)
+	}
+
+	cmd := exec.Command(f.ffmpegPath,
+		"-i", videoPath,
+		"-vn",
+		"-ar", "16000",
+		"-ac", "1",
+		"-f", "wav",
+		"-y",
+		outputWav,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// 视频无音轨时 ffmpeg 返回错误，不阻断主流程
+		fmt.Printf("[ffmpeg] 音频提取失败（视频可能无音轨，跳过音频检测）: %s\n", string(out))
+		return nil
+	}
+
+	// 检查输出文件是否存在且非空
+	info, err := os.Stat(outputWav)
+	if err != nil || info.Size() < 44 { // WAV header 至少 44 字节
+		fmt.Printf("[ffmpeg] 音频文件无效或为空，跳过音频检测\n")
+		os.Remove(outputWav)
+		return nil
+	}
+
+	fmt.Printf("[ffmpeg] 音频提取完成: %.1f KB\n", float64(info.Size())/1024)
+	return nil
+}

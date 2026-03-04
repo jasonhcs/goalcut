@@ -1,0 +1,7 @@
+{
+  "_说明": "在此填入视频中真实进球的时间戳（秒），用于评测各通道准确率",
+  "_视频": "amateur_game_01_summer_camp.mp4",
+  "_使用": "python channel_test.py ... --ground-truth ground_truth_example.json",
+  "goals": [
+  ]
+}
