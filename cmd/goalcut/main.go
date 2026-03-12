@@ -30,6 +30,7 @@ func main() {
 	after := flag.Float64("after", 0, "进球后截取秒数（覆盖配置文件）")
 	fps := flag.Float64("fps", 0, "采样帧率（覆盖配置文件）")
 	threshold := flag.Float64("threshold", 0, "置信度阈值（覆盖配置文件）")
+	algorithmProfile := flag.String("algorithm", "", "算法配置方案: default, pickup_with_net, pickup_no_net, minimal, vlm_primary")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "GoalCut - 篮球进球集锦自动生成工具\n\n")
@@ -80,6 +81,9 @@ func main() {
 	}
 	if *threshold > 0 {
 		cfg.Detection.ConfidenceThreshold = *threshold
+	}
+	if *algorithmProfile != "" {
+		cfg.Detection.AlgorithmProfile = *algorithmProfile
 	}
 
 	// 收集待处理的视频文件

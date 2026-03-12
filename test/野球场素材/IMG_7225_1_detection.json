@@ -1,0 +1,26 @@
+[
+  {
+    "frame_index": 78,
+    "timestamp": 13,
+    "confidence": 0.55,
+    "detail": "启发式: 球在篮筐上方消失, x=1161, y=359, dx=204"
+  },
+  {
+    "frame_index": 242,
+    "timestamp": 40.33,
+    "confidence": 0.562,
+    "detail": "启发式: 球在篮筐上方消失, x=1159, y=389, dx=202"
+  },
+  {
+    "frame_index": 402,
+    "timestamp": 67,
+    "confidence": 0.68,
+    "detail": "启发式: 球快速下落穿过篮筐区域, dy=172, prev_y=569"
+  },
+  {
+    "frame_index": 528,
+    "timestamp": 88,
+    "confidence": 0.68,
+    "detail": "启发式: 球快速下落穿过篮筐区域, dy=220, prev_y=581"
+  }
+]

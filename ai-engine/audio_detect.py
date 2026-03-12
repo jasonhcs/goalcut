@@ -356,12 +356,197 @@ def detect_whistle_events(
     return candidate_events
 
 
+def detect_cheer_events(
+    wav_path: str,
+    video_duration: float,
+    min_duration_ms: float = 300.0,
+    max_duration_ms: float = 3000.0,
+    min_burst_ratio: float = 2.5,
+    cooldown_s: float = 4.0,
+) -> List[dict]:
+    """
+    检测球友叫好声（进球后的欢呼/叫好）。
+
+    叫好声特征：宽频能量突发（不限于高频），持续 300ms~3s，
+    比入网声更长、频带更宽。
+
+    Returns:
+        [{"frame_index", "timestamp", "confidence", "detail"}, ...]
+    """
+    samples, sample_rate = read_wav(wav_path)
+    if samples is None or len(samples) == 0:
+        return []
+
+    # 宽频能量（500Hz~6kHz，涵盖人声基频和谐波）
+    hop_ms = 20
+    timestamps, band_energy = compute_stft_energy(
+        samples, sample_rate,
+        window_size_ms=40, hop_size_ms=hop_ms,
+        freq_low=500, freq_high=6000,
+    )
+
+    if len(band_energy) < 10:
+        return []
+
+    non_zero = band_energy[band_energy > 0]
+    if len(non_zero) < 10:
+        return []
+
+    mean_e = float(np.mean(non_zero))
+    std_e = float(np.std(non_zero))
+    if std_e < mean_e * 0.1:
+        return []
+
+    burst_threshold = mean_e + min_burst_ratio * std_e
+    min_frames = max(1, int(min_duration_ms / hop_ms))
+    max_frames = int(max_duration_ms / hop_ms)
+    cooldown_frames = int(cooldown_s * 1000 / hop_ms)
+
+    candidate_events = []
+    last_event_frame = -cooldown_frames - 1
+    i = 0
+
+    while i < len(band_energy):
+        if band_energy[i] <= burst_threshold or timestamps[i] < 1.0:
+            i += 1
+            continue
+
+        if i - last_event_frame < cooldown_frames:
+            i += 1
+            continue
+
+        burst_start = i
+        burst_end = i
+        while burst_end < len(band_energy) and band_energy[burst_end] > burst_threshold:
+            burst_end += 1
+
+        burst_duration_frames = burst_end - burst_start
+        if min_frames <= burst_duration_frames <= max_frames:
+            peak_idx = burst_start + np.argmax(band_energy[burst_start:burst_end])
+            peak_time = float(timestamps[peak_idx])
+
+            burst_ratio = (float(band_energy[peak_idx]) - mean_e) / (std_e + 1e-6)
+            confidence = min(0.60, 0.25 + 0.04 * burst_ratio)
+
+            if peak_time <= video_duration + 1.0:
+                candidate_events.append({
+                    "frame_index": int(peak_time * 3),
+                    "timestamp": round(peak_time, 2),
+                    "confidence": round(confidence, 3),
+                    "detail": (
+                        f"叫好声: duration={burst_duration_frames*hop_ms:.0f}ms, "
+                        f"ratio={burst_ratio:.1f}x"
+                    ),
+                })
+                last_event_frame = peak_idx
+
+        i = max(i + 1, burst_end)
+
+    print(f"[audio_detect] 检测到 {len(candidate_events)} 个叫好声事件", flush=True)
+    return candidate_events
+
+
+def detect_clap_events(
+    wav_path: str,
+    video_duration: float,
+    min_burst_ratio: float = 4.0,
+    cooldown_s: float = 3.0,
+) -> List[dict]:
+    """
+    检测击掌声。
+
+    击掌声特征：极短脉冲（<100ms），宽频冲击，频谱平坦（与入网声的高频集中不同）。
+
+    Returns:
+        [{"frame_index", "timestamp", "confidence", "detail"}, ...]
+    """
+    samples, sample_rate = read_wav(wav_path)
+    if samples is None or len(samples) == 0:
+        return []
+
+    # 宽频能量（全频段）
+    hop_ms = 5
+    timestamps, band_energy = compute_stft_energy(
+        samples, sample_rate,
+        window_size_ms=10, hop_size_ms=hop_ms,
+        freq_low=200, freq_high=8000,
+    )
+
+    if len(band_energy) < 20:
+        return []
+
+    non_zero = band_energy[band_energy > 0]
+    if len(non_zero) < 20:
+        return []
+
+    mean_e = float(np.mean(non_zero))
+    std_e = float(np.std(non_zero))
+    if std_e < mean_e * 0.1:
+        return []
+
+    burst_threshold = mean_e + min_burst_ratio * std_e
+    max_frames = int(100.0 / hop_ms)  # 击掌最长 100ms
+    cooldown_frames = int(cooldown_s * 1000 / hop_ms)
+
+    candidate_events = []
+    last_event_frame = -cooldown_frames - 1
+    i = 0
+
+    while i < len(band_energy):
+        if band_energy[i] <= burst_threshold or timestamps[i] < 1.0:
+            i += 1
+            continue
+        if i - last_event_frame < cooldown_frames:
+            i += 1
+            continue
+
+        burst_start = i
+        burst_end = i
+        while burst_end < len(band_energy) and band_energy[burst_end] > burst_threshold:
+            burst_end += 1
+
+        burst_duration_frames = burst_end - burst_start
+        # 击掌声极短（1~max_frames 帧，即 5~100ms）
+        if 1 <= burst_duration_frames <= max_frames:
+            peak_idx = burst_start + np.argmax(band_energy[burst_start:burst_end])
+            peak_time = float(timestamps[peak_idx])
+
+            # 验证：突发后 50ms 内能量回落（击掌是瞬态）
+            decay_end = min(len(band_energy), burst_end + int(50 / hop_ms))
+            post_energy = band_energy[burst_end:decay_end]
+            if len(post_energy) > 0 and float(np.mean(post_energy)) > burst_threshold * 0.5:
+                i = burst_end
+                continue
+
+            burst_ratio = (float(band_energy[peak_idx]) - mean_e) / (std_e + 1e-6)
+            confidence = min(0.55, 0.20 + 0.04 * burst_ratio)
+
+            if peak_time <= video_duration + 1.0:
+                candidate_events.append({
+                    "frame_index": int(peak_time * 3),
+                    "timestamp": round(peak_time, 2),
+                    "confidence": round(confidence, 3),
+                    "detail": (
+                        f"击掌声: duration={burst_duration_frames*hop_ms:.0f}ms, "
+                        f"ratio={burst_ratio:.1f}x"
+                    ),
+                })
+                last_event_frame = peak_idx
+
+        i = max(i + 1, burst_end)
+
+    print(f"[audio_detect] 检测到 {len(candidate_events)} 个击掌声事件", flush=True)
+    return candidate_events
+
+
 def detect_audio_events(
     audio_path: str,
     video_duration: float,
 ) -> List[dict]:
     """
-    综合入网声和哨声检测的统一入口。
+    综合音频事件检测的统一入口。
+
+    检测目标：入网声、哨声、叫好声、击掌声。
 
     Returns:
         候选事件列表，每个事件已注明来源（detail 字段）
@@ -376,7 +561,15 @@ def detect_audio_events(
     whistle_events = detect_whistle_events(audio_path, video_duration)
     events.extend(whistle_events)
 
-    # 按时间排序去重（2s 内认为同一事件）
+    # 叫好声检测（野球场进球后球友欢呼）
+    cheer_events = detect_cheer_events(audio_path, video_duration)
+    events.extend(cheer_events)
+
+    # 击掌声检测（进球后击掌庆祝）
+    clap_events = detect_clap_events(audio_path, video_duration)
+    events.extend(clap_events)
+
+    # 按时间排序去重（2s 内认为同一事件，保留置信度最高的）
     if not events:
         return []
 

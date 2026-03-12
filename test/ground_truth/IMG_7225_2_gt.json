@@ -1,0 +1,23 @@
+{
+  "video": "IMG_7225_2.mp4",
+  "duration": 120.14,
+  "total_goals": 4,
+  "goals": [
+    {
+      "timestamp": 30.0,
+      "note": "进球1"
+    },
+    {
+      "timestamp": 62.0,
+      "note": "进球2"
+    },
+    {
+      "timestamp": 88.0,
+      "note": "进球3"
+    },
+    {
+      "timestamp": 116.0,
+      "note": "进球4"
+    }
+  ]
+}

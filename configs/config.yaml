@@ -5,18 +5,314 @@ ffmpeg:
 
 detection:
   # 采样帧率（每秒提取帧数）
-  sample_fps: 3
+  sample_fps: 6
   # 进球置信度阈值
   confidence_threshold: 0.55
   # YOLO 检测置信度
   yolo_confidence: 0.25
   # Python 解释器路径
   python_path: "/opt/miniconda3/bin/python3"
+  # YOLO 模型路径（留空 = 自动检测: basketball > coco 回退）
+  # 支持绝对路径或相对于 ai-engine/ 的路径
+  yolo_model_path: ""
 
 highlight:
   # 进球前截取秒数
   before_seconds: 3
   # 进球后截取秒数
-  after_seconds: 1
+  after_seconds: 3
   # 相邻事件合并阈值（秒）
   merge_threshold: 4
+
+# ============================================================
+# VLM 全局配置
+# 所有算法方案共享此配置，启用 VLM 的方案从这里读取凭证。
+# api_key 为空时，VLM 相关功能自动跳过。
+# ============================================================
+vlm:
+  provider: "dashscope"            # VLM 服务商: dashscope / openai / gemini
+  api_key: ""                      # VLM API Key（必填，为空则 VLM 功能不可用）
+  model: "qwen-vl-max"             # VLM 模型名称：
+                                   #   dashscope: qwen-vl-max, qwen-vl-plus
+                                   #   openai:    gpt-4o, gpt-4o-mini
+                                   #   gemini:    gemini-1.5-pro, gemini-1.5-flash
+
+# ============================================================
+# 算法配置（Algorithm Profiles）
+#
+# 预定义多套通道组合，适配不同拍摄场景。
+# 每套方案可独立控制：通道开关、置信度上限、跨通道互证参数、VLM 模式。
+# VLM 的 provider/model/api_key 统一从上方 vlm 全局配置读取。
+#
+# 使用方式：
+#   Go CLI:    goalcut -input video.mp4 -algorithm pickup_no_net
+#   Python:    python detect.py --algorithm-profile pickup_no_net ...
+#   自定义文件: python detect.py --algorithm-config my_profile.yaml ...
+#   列出方案:  python detect.py --list-profiles ...
+#
+# 通道说明：
+#   1a  YOLO 球体检测 + 追踪 + 几何穿越判定（主力通道，精度最高）
+#   1b  启发式检测：球在篮筐区域消失 / 球快速下落（1a 的补充）
+#   2   人体运动模式：检测上篮/扣篮动作（误报率高，野球场建议禁用）
+#   3   局部运动突变：篮筐区域帧差分能量爆发（仅作候选触发信号）
+#   4   篮网有向光流穿越：检测篮网区域垂直向下的光流（需篮网可见）
+#   5   音频事件：入网声 + 哨声 + 叫好声 + 击掌声（需提供音频文件）
+#   6   ROI 多帧分类器：篮筐 ROI 堆叠多帧，CNN 二分类（需 ONNX 模型）
+#   7   庆祝动作检测：进球后球员急停/聚集（确认信号，不独立判断）
+#
+# detection_overrides 额外选项：
+#   tracker: "iou"（默认）或 "kalman"（含重力的抛物线预测）
+#   gravity_scale: Kalman 追踪器每帧重力增量（像素/帧^2，默认 2.0）
+#
+# 配置项说明：
+#   channels.<id>.enabled         通道开关（true/false）
+#   channels.<id>.confidence_cap  该通道置信度上限，即使被互证 boost 也不超过此值
+#   cross_validation.window       跨通道互证的时间窗口（秒），±window 内有不同通道命中才 boost
+#   cross_validation.boost_per_channel  每多一个互证通道的置信度增量
+#   cross_validation.max_boost    单次互证 boost 的上限值
+#   vlm.enabled                   是否启用 VLM（视觉语言模型）确认
+#   vlm.mode                      fallback=仅通道1a失效时启用 | always=常态过滤 | only=纯VLM
+#   vlm.confirm_range             VLM 确认的置信度区间 [min, max)，区间外的不经 VLM
+#   detection_overrides.*         覆盖全局检测参数（confidence_threshold / yolo_confidence 等）
+# ============================================================
+algorithm_profiles:
+
+  # ---------------------------------------------------------
+  # 默认配置：全通道启用
+  # 适用：通用场景、正式比赛、首次测试
+  # ---------------------------------------------------------
+  default:
+    description: "v2.6 默认全通道配置"
+    channels:
+      1a:                          # YOLO 球轨迹 + 几何穿越
+        enabled: true
+        confidence_cap: 0.95
+      1b:                          # 启发式（消失/下落）
+        enabled: true
+        confidence_cap: 0.75
+      2:                           # 人体运动（上篮检测）
+        enabled: true
+        confidence_cap: 0.55
+      3:                           # 帧差分运动突变
+        enabled: true
+        confidence_cap: 0.35       # 仅作触发信号，不独立判断进球
+      4:                           # 篮网有向光流穿越
+        enabled: true
+        confidence_cap: 0.70
+      5:                           # 音频（入网声 + 哨声 + 叫好声 + 击掌声）
+        enabled: true
+        confidence_cap: 0.70
+      6:                           # ROI 多帧分类器（需 ONNX 模型）
+        enabled: false             # 默认禁用：需先训练模型
+        confidence_cap: 0.90
+      7:                           # 庆祝动作检测（急停/聚集）
+        enabled: false             # 默认禁用：实验阶段
+        confidence_cap: 0.50
+    cross_validation:
+      window: 2.0                  # ±2s 内有不同通道命中才互证
+      boost_per_channel: 0.08      # 每个互证通道 +0.08
+      max_boost: 0.15              # 单次 boost 上限
+    vlm:
+      enabled: false
+      mode: "fallback"             # 仅通道1a失效时才启用 VLM
+      confirm_range: [0.35, 0.70]
+
+  # ---------------------------------------------------------
+  # 半场野球场（篮网清晰）
+  # 适用：固定机位、篮网完好、画面中篮网纹理可见
+  # 变更：禁用通道2（误报源），VLM 常态过滤中等置信度候选
+  # ---------------------------------------------------------
+  pickup_with_net:
+    description: "半场野球场，篮网清晰可见"
+    detection_overrides:
+      tracker: "kalman"            # 使用 Kalman 物理追踪器（抛物线预测）
+    channels:
+      1a:
+        enabled: true
+        confidence_cap: 0.95
+      1b:
+        enabled: true
+        confidence_cap: 0.75
+      2:
+        enabled: false             # 禁用：投篮动作≠进球，误报率 >50%
+      3:
+        enabled: true
+        confidence_cap: 0.35
+      4:
+        enabled: true              # 篮网清晰时此通道有效
+        confidence_cap: 0.70
+      5:                           # 入网声 + 叫好声 + 击掌声
+        enabled: true
+        confidence_cap: 0.70
+      6:                           # ROI 分类器（有模型时启用）
+        enabled: false
+        confidence_cap: 0.90
+      7:                           # 庆祝动作确认
+        enabled: true
+        confidence_cap: 0.50
+    cross_validation:
+      window: 2.0
+      boost_per_channel: 0.08
+      max_boost: 0.15
+    vlm:
+      enabled: true
+      mode: "always"               # 常态过滤：对 [0.35, 0.70) 的候选做 VLM 确认
+      confirm_range: [0.35, 0.70]
+
+  # ---------------------------------------------------------
+  # 半场野球场（篮网不清 / 无网）
+  # 适用：远景拍摄、破网、无网的室外球场
+  # 变更：禁用通道2和4（篮网不可见则光流无效），
+  #       VLM 常态过滤，确认范围下移至 0.30
+  # ---------------------------------------------------------
+  pickup_no_net:
+    description: "半场野球场，篮网不清晰或无网"
+    detection_overrides:
+      tracker: "kalman"            # Kalman 追踪：远景更易遮挡，抛物线预测有效
+    channels:
+      1a:
+        enabled: true
+        confidence_cap: 0.95
+      1b:
+        enabled: true
+        confidence_cap: 0.70
+      2:
+        enabled: false             # 禁用：误报灾难
+      3:
+        enabled: true
+        confidence_cap: 0.30       # 进一步降权，仅作候选触发
+      4:
+        enabled: false             # 禁用：篮网不可见，光流无信号
+      5:                           # 叫好声 + 击掌声为主（入网声弱/不存在）
+        enabled: true
+        confidence_cap: 0.60
+      6:                           # ROI 分类器（不依赖篮网，有模型时启用）
+        enabled: false
+        confidence_cap: 0.90
+      7:                           # 庆祝动作确认
+        enabled: true
+        confidence_cap: 0.50
+    cross_validation:
+      window: 2.0
+      boost_per_channel: 0.08
+      max_boost: 0.15
+    vlm:
+      enabled: true
+      mode: "always"               # 常态过滤：有效通道少，VLM 补充判断力
+      confirm_range: [0.30, 0.65]  # 下移：更多候选需要 VLM 确认
+
+  # ---------------------------------------------------------
+  # 极简模式：仅核心视觉通道
+  # 适用：快速测试、排除多通道干扰、基准对比
+  # 仅保留最可靠的通道1a（几何穿越）和1b（启发式）
+  # ---------------------------------------------------------
+  minimal:
+    description: "仅通道1a+1b，最低误报"
+    channels:
+      1a:
+        enabled: true
+        confidence_cap: 0.95
+      1b:
+        enabled: true
+        confidence_cap: 0.70
+      2:
+        enabled: false
+      3:
+        enabled: false
+      4:
+        enabled: false
+      5:
+        enabled: false
+      6:
+        enabled: false
+      7:
+        enabled: false
+    cross_validation:
+      window: 2.0
+      boost_per_channel: 0.08
+      max_boost: 0.15
+    vlm:
+      enabled: false
+
+  # ---------------------------------------------------------
+  # VLM 主导模式：低阈值粗筛 + VLM 精确过滤
+  # 适用：希望最高准确率的场景
+  # 策略：降低 confidence_threshold 至 0.35 产生更多候选，
+  #       然后用 VLM 对几乎全范围 [0.20, 0.95) 做确认，
+  #       VLM 否决则过滤，VLM 确认则保留
+  # 注意：VLM 调用量较大（~15-50 次/视频），需配置 vlm.api_key
+  # ---------------------------------------------------------
+  vlm_primary:
+    description: "低阈值粗筛候选，VLM 逐一确认"
+    detection_overrides:
+      confidence_threshold: 0.35   # 覆盖全局阈值，产生更多候选供 VLM 过滤
+      tracker: "kalman"
+    channels:
+      1a:
+        enabled: true
+        confidence_cap: 0.95
+      1b:
+        enabled: true
+        confidence_cap: 0.75
+      2:
+        enabled: false
+      3:
+        enabled: true
+        confidence_cap: 0.35
+      4:
+        enabled: false             # VLM 已提供语义判断，不需要光流辅助
+      5:
+        enabled: true
+        confidence_cap: 0.70
+      6:                           # ROI 分类器（有模型时启用）
+        enabled: false
+        confidence_cap: 0.90
+      7:
+        enabled: true              # 庆祝动作辅助 VLM 判断
+        confidence_cap: 0.50
+    cross_validation:
+      window: 2.0
+      boost_per_channel: 0.08
+      max_boost: 0.15
+    vlm:
+      enabled: true
+      mode: "always"
+      confirm_range: [0.20, 0.95]  # 几乎全范围 VLM 确认
+
+  # ---------------------------------------------------------
+  # 纯 VLM 模式：完全依赖大模型判断，不跑任何视觉通道
+  # 适用：视觉通道效果差的场景、快速验证 VLM 能力、对比测试基准
+  # 策略：用滑动窗口（6s 窗口、3s 步长）逐段扫描全视频，
+  #       每段采样 8 帧送 VLM，直接由大模型判断是否有进球
+  # 优点：零规则依赖，不受篮网/遮挡/视角等影响
+  # 缺点：VLM 调用量大（~180 次/30min 视频），需配置 vlm.api_key
+  # ---------------------------------------------------------
+  vlm_only:
+    description: "纯 VLM 模式，完全依赖大模型判断进球"
+    channels:
+      1a:
+        enabled: false
+      1b:
+        enabled: false
+      2:
+        enabled: false
+      3:
+        enabled: false
+      4:
+        enabled: false
+      5:
+        enabled: false
+      6:
+        enabled: false
+      7:
+        enabled: false
+    cross_validation:
+      window: 2.0
+      boost_per_channel: 0.08
+      max_boost: 0.15
+    vlm:
+      enabled: true
+      mode: "only"                 # only=纯 VLM 扫描，不依赖任何通道候选
+      scan_window: 6.0             # 滑动窗口大小（秒）
+      scan_step: 2.0               # 滑动步长（秒）— 与验证工具一致，覆盖更密
+      scan_frames: 8               # 每个窗口采样帧数

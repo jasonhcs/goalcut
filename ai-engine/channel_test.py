@@ -67,12 +67,29 @@ def load_frames_and_model(frames_dir: str, yolo_confidence: float):
     img_h, img_w = sample_img.shape[:2]
     log(f"帧数: {len(frame_files)}, 尺寸: {img_w}x{img_h}")
 
-    # 加载 YOLO
+    # 加载 YOLO（优先使用篮球专用模型）
     model = None
+    _using_basketball_model = False
     try:
         from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
-        log("YOLOv8n 模型加载成功")
+        _ai_engine_dir = os.path.dirname(os.path.abspath(__file__))
+        _basketball_model_candidates = [
+            os.path.join(_ai_engine_dir, "models", "basketball_v1", "weights", "best.pt"),
+            os.path.join(_ai_engine_dir, "runs", "detect", "models", "basketball_v1", "weights", "best.pt"),
+        ]
+        _BASKETBALL_MODEL = None
+        for _candidate in _basketball_model_candidates:
+            if os.path.exists(_candidate):
+                _BASKETBALL_MODEL = _candidate
+                break
+        if _BASKETBALL_MODEL:
+            model = YOLO(_BASKETBALL_MODEL)
+            _using_basketball_model = True
+            log(f"篮球专用 YOLO 模型加载成功")
+            log(f"  模型类别: {model.names}")
+        else:
+            model = YOLO("yolov8n.pt")
+            log("YOLOv8n COCO 模型加载成功")
     except Exception as e:
         log(f"YOLO 加载失败: {e} (通道 1a/1b/2 不可用)")
 
@@ -81,6 +98,7 @@ def load_frames_and_model(frames_dir: str, yolo_confidence: float):
         "img_w": img_w,
         "img_h": img_h,
         "model": model,
+        "_using_basketball_model": _using_basketball_model,
     }
 
 
@@ -96,7 +114,19 @@ def detect_hoop_and_balls(ctx: dict, sample_fps: float, yolo_confidence: float):
         log("YOLO 不可用，跳过球体检测")
         return None, None, None
 
-    BALL_CLASS = 32
+    # 根据模型类别自动判断球体 class ID
+    _using_basketball_model = ctx.get("_using_basketball_model", False)
+    if _using_basketball_model:
+        BALL_CLASS = None
+        for cls_id, name in model.names.items():
+            if name.lower() in ("basketball", "ball", "sports ball"):
+                BALL_CLASS = cls_id
+                break
+        if BALL_CLASS is None:
+            BALL_CLASS = 0
+        log(f"球体类别: class {BALL_CLASS} ({model.names.get(BALL_CLASS, '?')})")
+    else:
+        BALL_CLASS = 32  # COCO sports ball
     ball_yolo_conf = min(yolo_confidence, 0.25)
     ball_detections = []
 
@@ -105,7 +135,7 @@ def detect_hoop_and_balls(ctx: dict, sample_fps: float, yolo_confidence: float):
         if i % 50 == 0:
             log(f"  进度: {i+1}/{len(frame_files)}")
         try:
-            results = model(frame_path, conf=ball_yolo_conf, verbose=False)
+            results = model(frame_path, conf=ball_yolo_conf, imgsz=640, verbose=False)
             for r in results:
                 if r.boxes is None:
                     continue
@@ -259,20 +289,37 @@ def run_channel_3(ctx: dict, sample_fps: float,
 
 def run_channel_4(ctx: dict, hoop_info, sample_fps: float,
                   cooldown_s: float = 3.0,
-                  burst_ratio: float = 2.5) -> List[Dict]:
-    """通道 4: 篮网形变检测"""
+                  burst_ratio: float = 2.0,
+                  min_purity: float = 1.5,
+                  use_legacy: bool = False) -> List[Dict]:
+    """通道 4: 篮网有向光流穿越检测 (T-1.9.13 算法C)
+
+    默认使用有向光流检测，传 use_legacy=True 回退到旧版平均幅度。
+    """
     if hoop_info is None:
         log("通道 4: 无篮筐信息，跳过")
         return []
 
-    from net_deform import detect_net_deformation
-    events = detect_net_deformation(
-        ctx["frame_files"],
-        hoop_info["cx"], hoop_info["cy"], hoop_info["w"],
-        sample_fps=sample_fps,
-        cooldown_s=cooldown_s,
-        min_burst_ratio=burst_ratio,
-    )
+    if use_legacy:
+        from net_deform import detect_net_deformation
+        events = detect_net_deformation(
+            ctx["frame_files"],
+            hoop_info["cx"], hoop_info["cy"], hoop_info["w"],
+            sample_fps=sample_fps,
+            cooldown_s=cooldown_s,
+            min_burst_ratio=burst_ratio,
+        )
+    else:
+        from net_deform import detect_downward_flow_through_net
+        events = detect_downward_flow_through_net(
+            ctx["frame_files"],
+            hoop_info["cx"], hoop_info["cy"], hoop_info["w"],
+            sample_fps=sample_fps,
+            net_height_ratio=0.8,
+            min_burst_ratio=burst_ratio,
+            min_purity=min_purity,
+            cooldown_s=cooldown_s,
+        )
     return events
 
 

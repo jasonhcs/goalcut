@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-GoalCut AI 进球检测引擎 v2.2
+GoalCut AI 进球检测引擎 v2.7
 
-Phase 1.5 P2 增强版本，新增：
+Phase 1.5 P4 增强版本，新增（T-1.9.13 + T-1.9.14 + O-23）：
+- 因果推理链验证器（算法E，O-23）：在跨通道互证后对候选事件做时序因果检查，
+  区分投篮/上篮/罚球三种得分方式，孤立噪声事件惩罚 -0.15，强因果链 boost +0.12
+- 通道4改为有向光流穿越检测（算法C），区分进球（垂直向下）与篮板争抢（横向混乱）
+- 精扫阶段全帧采样（frame_step=1），解决3fps采样率与球穿越时间窗口的物理冲突
+- 通道3（运动突变）置信度上限从0.50降至0.35，仅作候选触发信号而非独立进球信号
+- 篮网ROI高度系数从1.5优化为1.2，减少无关区域噪声
+
+v2.4 已有：
+- 自适应融合策略（通道1a失效时启用VLM混合模式）
+- VLM逐事件确认 + VLM独立扫描补充漏检
+
+v2.2 已有：
 - 篮网形变检测（光流法，net_deform.py，通道 4）
 - 入网声/哨声检测（audio_detect.py，通道 5）
 - 两阶段采样策略（粗扫定位候选区间，精扫几何判定，--two-stage）
@@ -27,6 +39,225 @@ from typing import List, Dict, Tuple, Optional
 
 def log(msg):
     print(f"[ai-engine] {msg}", flush=True)
+
+
+# ============================================================
+# 算法配置（Algorithm Profile）
+# ============================================================
+
+class AlgorithmProfile:
+    """算法配置：定义通道开关、置信度上限、互证参数、VLM 模式。
+
+    加载来源（优先级从高到低）：
+    1. --algorithm-config <yaml 文件路径>  独立配置文件
+    2. --algorithm-profile <名称>          config.yaml 中的预定义方案
+    3. 命令行 --channel 参数               向后兼容的通道过滤
+    4. 代码默认值                          全通道启用
+    """
+
+    # 所有已知通道 ID
+    ALL_CHANNELS = {"1a", "1b", "2", "3", "4", "5", "6", "7"}
+
+    # 代码内置默认值
+    DEFAULT_CAPS = {
+        "1a": 0.95,
+        "1b": 0.60,
+        "2": 0.55,
+        "3": 0.35,
+        "4": 0.70,
+        "5": 0.70,
+        "6": 0.90,
+        "7": 0.50,
+    }
+
+    # 通道 ID → detail 前缀的映射（用于匹配 WEAK_CHANNEL_CAPS）
+    CHANNEL_DETAIL_MAP = {
+        "1a": ["几何判定", "辅助判定"],
+        "1b": ["启发式"],
+        "2": ["人体运动"],
+        "3": ["运动突变"],
+        "4": ["篹网形变", "篹网有向穿越", "篮网形变", "篮网有向穿越"],
+        "5": ["入网声", "哨声", "叫好声", "击掌声"],
+        "6": ["ROI分类器"],
+        "7": ["庆祝动作"],
+    }
+
+    def __init__(self):
+        self.name = "default"
+        self.description = "v2.5 默认全通道配置"
+        self.channels = {}  # channel_id -> {"enabled": bool, "confidence_cap": float}
+        self.cross_validation = {
+            "window": 2.0,
+            "boost_per_channel": 0.08,
+            "max_boost": 0.15,
+        }
+        self.vlm = {
+            "enabled": False,
+            "mode": "fallback",
+            "confirm_range": [0.35, 0.70],
+        }
+        self.detection_overrides = {}
+
+        for ch_id in self.ALL_CHANNELS:
+            self.channels[ch_id] = {
+                "enabled": True,
+                "confidence_cap": self.DEFAULT_CAPS.get(ch_id, 0.95),
+            }
+
+    def is_enabled(self, channel_id: str) -> bool:
+        ch = self.channels.get(channel_id)
+        return ch is not None and ch.get("enabled", True)
+
+    def get_cap(self, channel_id: str) -> float:
+        ch = self.channels.get(channel_id)
+        if ch:
+            return ch.get("confidence_cap", 0.95)
+        return 0.95
+
+    def get_cap_by_detail(self, detail_prefix: str) -> float:
+        """根据事件 detail 前缀查找置信度上限"""
+        for ch_id, prefixes in self.CHANNEL_DETAIL_MAP.items():
+            if detail_prefix in prefixes:
+                return self.get_cap(ch_id)
+        return 0.95
+
+    def build_weak_channel_caps(self) -> Dict[str, float]:
+        """生成 WEAK_CHANNEL_CAPS 字典（detail 前缀 → 置信度上限）"""
+        caps = {}
+        for ch_id, prefixes in self.CHANNEL_DETAIL_MAP.items():
+            cap = self.get_cap(ch_id)
+            if cap < 0.95:
+                for prefix in prefixes:
+                    caps[prefix] = cap
+        # 击掌声单独降权：野球场击掌声密度高、误报多，
+        # 单独设置更低的 cap 以减少其作为独立事件的误报
+        caps["击掌声"] = min(caps.get("击掌声", 0.95), 0.50)
+        # 入网声降权：野球场环境下球碰篮板/篮筐也可能触发高频能量突发
+        caps["入网声"] = min(caps.get("入网声", 0.95), 0.60)
+        return caps
+
+    def get_enabled_set(self) -> set:
+        """返回启用的通道 ID 集合（用于 ch_enabled 检查）"""
+        return {ch_id for ch_id, cfg in self.channels.items()
+                if cfg.get("enabled", True)}
+
+    def summary(self) -> str:
+        lines = [f"算法配置: {self.name} — {self.description}"]
+        for ch_id in sorted(self.channels.keys(),
+                            key=lambda x: (x.replace("a","0").replace("b","1"))):
+            cfg = self.channels[ch_id]
+            status = "启用" if cfg.get("enabled") else "禁用"
+            cap = cfg.get("confidence_cap", 0.95)
+            lines.append(f"  通道 {ch_id}: {status} (上限={cap})")
+        vlm_status = "启用" if self.vlm.get("enabled") else "禁用"
+        vlm_mode = self.vlm.get("mode", "fallback")
+        lines.append(f"  VLM: {vlm_status} (模式={vlm_mode})")
+        cv = self.cross_validation
+        lines.append(f"  互证: 窗口={cv['window']}s, "
+                      f"boost={cv['boost_per_channel']}/通道, "
+                      f"上限={cv['max_boost']}")
+        return "\n".join(lines)
+
+    @classmethod
+    def from_dict(cls, data: dict, name: str = "custom") -> "AlgorithmProfile":
+        """从字典（YAML 解析结果）创建配置"""
+        profile = cls()
+        profile.name = name
+        profile.description = data.get("description", name)
+
+        if "channels" in data:
+            for ch_id, ch_cfg in data["channels"].items():
+                ch_id = str(ch_id)
+                if ch_id not in profile.channels:
+                    profile.channels[ch_id] = {}
+                if isinstance(ch_cfg, dict):
+                    profile.channels[ch_id]["enabled"] = ch_cfg.get("enabled", True)
+                    if "confidence_cap" in ch_cfg:
+                        profile.channels[ch_id]["confidence_cap"] = ch_cfg["confidence_cap"]
+                elif isinstance(ch_cfg, bool):
+                    profile.channels[ch_id]["enabled"] = ch_cfg
+
+        if "cross_validation" in data:
+            profile.cross_validation.update(data["cross_validation"])
+
+        if "vlm" in data:
+            profile.vlm.update(data["vlm"])
+
+        if "detection_overrides" in data:
+            profile.detection_overrides = data["detection_overrides"]
+
+        return profile
+
+    @classmethod
+    def load(cls, profile_name: str = None,
+             config_path: str = None) -> "AlgorithmProfile":
+        """加载算法配置。
+
+        Args:
+            profile_name: 预定义方案名称（从 config.yaml 的 algorithm_profiles 中读取）
+            config_path: 独立算法配置 YAML 文件路径
+        """
+        if config_path and os.path.exists(config_path):
+            try:
+                import yaml
+            except ImportError:
+                log("警告: 加载 YAML 需要 pyyaml (pip install pyyaml)")
+                return cls()
+            with open(config_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            name = os.path.basename(config_path).replace(".yaml", "")
+            if "channels" in data:
+                return cls.from_dict(data, name)
+            if "algorithm_profiles" in data and profile_name:
+                pdata = data["algorithm_profiles"].get(profile_name)
+                if pdata:
+                    return cls.from_dict(pdata, profile_name)
+            return cls()
+
+        if profile_name:
+            candidates = [
+                os.path.join(os.path.dirname(__file__), "..", "configs", "config.yaml"),
+                os.path.join(os.path.dirname(__file__), "configs", "config.yaml"),
+                "configs/config.yaml",
+            ]
+            for cfg_path in candidates:
+                if os.path.exists(cfg_path):
+                    try:
+                        import yaml
+                        with open(cfg_path, 'r', encoding='utf-8') as f:
+                            data = yaml.safe_load(f)
+                        profiles = data.get("algorithm_profiles", {})
+                        if profile_name in profiles:
+                            profile = cls.from_dict(profiles[profile_name],
+                                                     profile_name)
+                            # 用全局 vlm 段填充方案中未设置的 VLM 凭证
+                            global_vlm = data.get("vlm", {})
+                            for key in ("provider", "model", "api_key"):
+                                if not profile.vlm.get(key):
+                                    profile.vlm[key] = global_vlm.get(key, "")
+                            return profile
+                        else:
+                            available = list(profiles.keys())
+                            log(f"警告: 未找到算法配置 '{profile_name}'，"
+                                f"可选: {available}")
+                    except ImportError:
+                        log("警告: 加载 YAML 需要 pyyaml")
+                    except Exception as e:
+                        log(f"警告: 加载配置失败: {e}")
+                    break
+
+        return cls()
+
+    @classmethod
+    def from_channel_filter(cls, channel_str: str) -> "AlgorithmProfile":
+        """从 --channel 参数向后兼容创建配置（如 '1a,3,5'）"""
+        profile = cls()
+        profile.name = "custom_filter"
+        profile.description = f"命令行通道过滤: {channel_str}"
+        enabled = set(c.strip() for c in channel_str.split(","))
+        for ch_id in profile.channels:
+            profile.channels[ch_id]["enabled"] = ch_id in enabled
+        return profile
 
 
 # ============================================================
@@ -93,7 +324,9 @@ class HoopDetector:
             names = model.names
             hoop_classes = []
             for cls_id, name in names.items():
-                if name.lower() in ('hoop', 'basket', 'rim', 'backboard'):
+                if name.lower() in ('hoop', 'basket', 'rim', 'backboard',
+                                     'basketball-hoop', 'basketball_hoop',
+                                     'ring', 'basket-rim'):
                     hoop_classes.append(cls_id)
             if not hoop_classes:
                 return None
@@ -103,7 +336,7 @@ class HoopDetector:
             sample_indices = np.linspace(0, len(frame_files) - 1,
                                          min(20, len(frame_files)), dtype=int)
             for idx in sample_indices:
-                results = model(frame_files[idx], conf=0.3, verbose=False)
+                results = model(frame_files[idx], conf=0.3, imgsz=640, verbose=False)
                 for r in results:
                     if r.boxes is None:
                         continue
@@ -416,20 +649,38 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
     2. 人体位置在连续帧中快速上移（向篮筐接近）
     3. 人体到达最高点后下降（投篮完成）
 
-    改进: 追踪画面中每个区域(左半/右半)最高的人，避免多人跳跃追踪。
+    改进v2: 提高上升帧数阈值(3→)，缩小篮筐区域，降低置信度上限，
+    减少左右半场重叠，增加位移幅度要求。
     """
     log("开始人体运动模式检测...")
 
-    PERSON_CLASS = 0
-    # 篮筐区域：画面上半部分（Y < 60% 画面高度，放宽）
-    hoop_zone_y = img_h * 0.6
+    # 根据模型类别自动判断人体 class ID
+    # 通过检查 model.names 判断是否为篮球专用模型
+    _is_basketball = any(
+        n.lower() in ("ball", "basketball") for n in model.names.values()
+    )
+    if _is_basketball:
+        PERSON_CLASS = None
+        for cls_id, name in model.names.items():
+            if name.lower() in ("person", "player"):
+                PERSON_CLASS = cls_id
+                break
+        if PERSON_CLASS is None:
+            log("警告: 篮球专用模型中未找到 person/player 类别")
+            PERSON_CLASS = -1  # 不存在，跳过人体检测
+        else:
+            log(f"人体类别: class {PERSON_CLASS} ({model.names.get(PERSON_CLASS, '?')})")
+    else:
+        PERSON_CLASS = 0  # COCO person
+    # 篮筐区域：画面上部（Y < 45% 画面高度），比之前更严格
+    hoop_zone_y = img_h * 0.45
 
     # 收集所有帧中的人体检测
     frame_persons = {}  # {frame_idx: [(cx, cy, w, h, conf), ...]}
 
     for i, frame_path in enumerate(frame_files):
         try:
-            results = model(frame_path, conf=yolo_confidence, verbose=False)
+            results = model(frame_path, conf=yolo_confidence, imgsz=640, verbose=False)
             persons = []
             for r in results:
                 if r.boxes is None:
@@ -461,12 +712,13 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
     # 跳过视频开头的帧（前3秒通常有转场/字幕）
     skip_frames = int(sample_fps * 3)
 
-    # 对左半场和右半场分别检测上篮模式
-    for side_name, x_filter in [("left", lambda cx: cx < mid_x * 1.2),
-                                 ("right", lambda cx: cx > mid_x * 0.8)]:
+    # 对左半场和右半场分别检测上篮模式（减少重叠区域）
+    for side_name, x_filter in [("left", lambda cx: cx < mid_x * 1.05),
+                                 ("right", lambda cx: cx > mid_x * 0.95)]:
         prev_top_cy = None
         prev_fidx = -999
         rising_count = 0
+        total_rise = 0
         peak_frame = -1
         peak_cy = 9999
         peak_cx = 0
@@ -477,12 +729,13 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
             side_persons = [p for p in persons if x_filter(p[0])]
             if not side_persons:
                 # 该半场无人，如果之前在上升中，视为可能的上篮完成
-                if (rising_count >= 2 and peak_cy < hoop_zone_y
-                        and peak_frame > skip_frames):
+                if (rising_count >= 3 and peak_cy < hoop_zone_y
+                        and peak_frame > skip_frames
+                        and total_rise > img_h * 0.06):
                     timestamp = peak_frame / sample_fps
                     height_factor = max(0, 1.0 - peak_cy / hoop_zone_y)
-                    conf = min(0.75, 0.4 + 0.1 * rising_count
-                               + 0.2 * height_factor)
+                    conf = min(0.55, 0.30 + 0.05 * rising_count
+                               + 0.15 * height_factor)
                     candidate_events.append({
                         "frame_index": peak_frame,
                         "timestamp": round(timestamp, 2),
@@ -494,6 +747,7 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
                     })
                 rising_count = 0
                 peak_cy = 9999
+                total_rise = 0
                 prev_top_cy = None
                 prev_fidx = -999
                 continue
@@ -504,19 +758,21 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
             if prev_top_cy is not None and fidx - prev_fidx <= 2:
                 dy = top_cy - prev_top_cy  # dy < 0 = 上升
 
-                if dy < -img_h * 0.015:  # 上升（1.5%画面高度）
+                if dy < -img_h * 0.02:  # 上升（2%画面高度，更严格）
                     rising_count += 1
+                    total_rise += abs(dy)
                     if top_cy < peak_cy:
                         peak_cy = top_cy
                         peak_frame = fidx
                         peak_cx = top_cx
-                elif dy > img_h * 0.01 and rising_count >= 2:
+                elif dy > img_h * 0.01 and rising_count >= 3:
                     # 下降 → 上篮可能完成
-                    if peak_cy < hoop_zone_y and peak_frame > skip_frames:
+                    if (peak_cy < hoop_zone_y and peak_frame > skip_frames
+                            and total_rise > img_h * 0.06):
                         timestamp = peak_frame / sample_fps
                         height_factor = max(0, 1.0 - peak_cy / hoop_zone_y)
-                        conf = min(0.75, 0.4 + 0.1 * rising_count
-                                   + 0.2 * height_factor)
+                        conf = min(0.55, 0.30 + 0.05 * rising_count
+                                   + 0.15 * height_factor)
                         candidate_events.append({
                             "frame_index": peak_frame,
                             "timestamp": round(timestamp, 2),
@@ -528,19 +784,22 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
                         })
                     rising_count = 0
                     peak_cy = 9999
+                    total_rise = 0
                 elif dy >= 0:
                     # 停滞或微降，如果之前上升不够就重置
-                    if rising_count < 2:
+                    if rising_count < 3:
                         rising_count = 0
                         peak_cy = 9999
+                        total_rise = 0
             else:
                 # 帧不连续，结算之前的上升
-                if (rising_count >= 2 and peak_cy < hoop_zone_y
-                        and peak_frame > skip_frames):
+                if (rising_count >= 3 and peak_cy < hoop_zone_y
+                        and peak_frame > skip_frames
+                        and total_rise > img_h * 0.06):
                     timestamp = peak_frame / sample_fps
                     height_factor = max(0, 1.0 - peak_cy / hoop_zone_y)
-                    conf = min(0.70, 0.35 + 0.1 * rising_count
-                               + 0.2 * height_factor)
+                    conf = min(0.50, 0.28 + 0.05 * rising_count
+                               + 0.12 * height_factor)
                     candidate_events.append({
                         "frame_index": peak_frame,
                         "timestamp": round(timestamp, 2),
@@ -552,17 +811,19 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
                     })
                 rising_count = 0
                 peak_cy = 9999
+                total_rise = 0
 
             prev_top_cy = top_cy
             prev_fidx = fidx
 
         # 循环结束，结算未处理的上升
-        if (rising_count >= 2 and peak_cy < hoop_zone_y
-                and peak_frame > skip_frames):
+        if (rising_count >= 3 and peak_cy < hoop_zone_y
+                and peak_frame > skip_frames
+                and total_rise > img_h * 0.06):
             timestamp = peak_frame / sample_fps
             height_factor = max(0, 1.0 - peak_cy / hoop_zone_y)
-            conf = min(0.70, 0.35 + 0.1 * rising_count
-                       + 0.2 * height_factor)
+            conf = min(0.50, 0.28 + 0.05 * rising_count
+                       + 0.12 * height_factor)
             candidate_events.append({
                 "frame_index": peak_frame,
                 "timestamp": round(timestamp, 2),
@@ -572,6 +833,17 @@ def detect_goals_by_person_motion(frame_files: List[str], model,
                            f"peak_y={peak_cy:.0f}, "
                            f"cx={peak_cx:.0f}")
             })
+
+    # 去重：左右半场重叠区域可能检测到同一事件
+    if len(candidate_events) > 1:
+        candidate_events.sort(key=lambda e: e["timestamp"])
+        deduped = [candidate_events[0]]
+        for ev in candidate_events[1:]:
+            if ev["timestamp"] - deduped[-1]["timestamp"] > 3.0:
+                deduped.append(ev)
+            elif ev["confidence"] > deduped[-1]["confidence"]:
+                deduped[-1] = ev
+        candidate_events = deduped
 
     log(f"人体运动检测产生 {len(candidate_events)} 个候选事件")
     return candidate_events
@@ -659,7 +931,8 @@ def detect_goals_by_motion(frame_files: List[str], img_w: int, img_h: int,
                     if avg_next < score * 0.5:
                         timestamp = fidx / sample_fps
                         burst_ratio = (score - mean_s) / (std_s + 1e-6)
-                        conf = min(0.55, 0.3 + 0.05 * burst_ratio)
+                        # T-1.9.14: 通道3上限从0.50降至0.35，仅作触发信号
+                        conf = min(0.35, 0.2 + 0.04 * burst_ratio)
                         candidate_events.append({
                             "frame_index": fidx,
                             "timestamp": round(timestamp, 2),
@@ -733,13 +1006,60 @@ def two_stage_filter_frames(frame_files: List[str], sample_fps: float,
 def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
                  yolo_confidence, video_duration,
                  audio_file=None, enable_net_deform=False, two_stage=False,
-                 enabled_channels=None):
-    """主检测流程 v2.3 - 多通道并行检测（含篮网形变 + 音频 + 通道选择）
+                 enabled_channels=None, source_video=None, vlm_confirm=False,
+                 algorithm_profile=None):
+    """主检测流程 v2.5 - 多通道并行检测（有向光流通道4 + 全帧精扫 + 通道3降权）
+    
+    v2.5 变更：
+    - 通道4改为有向光流穿越检测（detect_downward_flow_through_net）
+    - 精扫阶段全帧不跳过（frame_step=1），确保捕捉穿越帧
+    - 通道3（运动突变）置信度上限降至0.35
+    - 篮网ROI高度系数优化
+    
+    v2.6 新增：
+    - algorithm_profile: AlgorithmProfile 对象，定义通道开关/置信度上限/互证参数/VLM模式
+    - 支持预定义方案（pickup_no_net, pickup_with_net, minimal, vlm_primary）
+    - 向后兼容：未传 profile 时行为与 v2.5 完全一致
     
     Args:
         enabled_channels: 指定要运行的通道集合，如 {"1a","2","5"}。None=全部。
+                         （向后兼容，优先级低于 algorithm_profile）
+        source_video: 源视频路径（VLM确认时需要，用于采样帧）
+        vlm_confirm: 是否在通道1a失效时启用VLM逐事件确认
+        algorithm_profile: AlgorithmProfile 对象。传入后覆盖 enabled_channels/vlm_confirm
+                          等参数，实现完整的算法组合自定义。
     """
-    log(f"开始进球检测 (v2.3)")
+    # 算法配置：profile 优先，其次 enabled_channels，最后全部启用
+    profile = algorithm_profile or AlgorithmProfile()
+    if algorithm_profile:
+        log(f"\n{profile.summary()}")
+        # profile 中的通道开关覆盖 enabled_channels
+        enabled_channels = profile.get_enabled_set()
+        # profile 中的 VLM 设置覆盖命令行
+        if profile.vlm.get("enabled"):
+            vlm_confirm = True
+        # 将 VLM 凭证注入模块级变量（方案级覆盖全局）
+        global _vlm_config
+        _vlm_config = {
+            "provider": profile.vlm.get("provider", ""),
+            "model": profile.vlm.get("model", ""),
+            "api_key": profile.vlm.get("api_key", ""),
+        }
+        # profile 中的检测参数覆盖
+        overrides = profile.detection_overrides
+        if "confidence_threshold" in overrides:
+            confidence_threshold = overrides["confidence_threshold"]
+        if "yolo_confidence" in overrides:
+            yolo_confidence = overrides["yolo_confidence"]
+        if "sample_fps" in overrides:
+            sample_fps = overrides["sample_fps"]
+        # profile 中通道 4 的开关覆盖 enable_net_deform
+        if profile.is_enabled("4"):
+            enable_net_deform = True
+        else:
+            enable_net_deform = False
+
+    log(f"开始进球检测 (v2.6)")
     log(f"  帧目录: {frames_dir}")
     log(f"  采样帧率: {sample_fps}")
     log(f"  置信度阈值: {confidence_threshold}")
@@ -755,13 +1075,35 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
         """检查通道是否启用"""
         return enabled_channels is None or ch_name in enabled_channels
 
-    # 加载 YOLO 模型
-    log("加载 YOLOv8 模型...")
+    # 加载 YOLO 模型（优先使用篮球专用模型）
+    log("加载 YOLO 模型...")
     model = None
+    _using_basketball_model = False
     try:
         from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
-        log("YOLOv8n 模型加载成功")
+
+        # 篮球专用模型路径（检查多个可能位置）
+        _ai_engine_dir = os.path.dirname(os.path.abspath(__file__))
+        _basketball_model_candidates = [
+            os.path.join(_ai_engine_dir, "models", "basketball_v1", "weights", "best.pt"),
+            os.path.join(_ai_engine_dir, "runs", "detect", "models", "basketball_v1", "weights", "best.pt"),
+        ]
+        _BASKETBALL_MODEL = None
+        for _candidate in _basketball_model_candidates:
+            if os.path.exists(_candidate):
+                _BASKETBALL_MODEL = _candidate
+                break
+
+        _COCO_MODEL = os.path.join(_ai_engine_dir, "yolov8n.pt")
+
+        if _BASKETBALL_MODEL:
+            model = YOLO(_BASKETBALL_MODEL)
+            _using_basketball_model = True
+            log(f"篮球专用 YOLO 模型加载成功: {_BASKETBALL_MODEL}")
+            log(f"  模型类别: {model.names}")
+        else:
+            model = YOLO(_COCO_MODEL if os.path.exists(_COCO_MODEL) else "yolov8n.pt")
+            log(f"篮球专用模型不存在，回退到 COCO 预训练: yolov8n.pt")
     except Exception as e:
         log(f"加载 YOLO 模型失败: {e}")
         log("回退到简化检测模式（无 YOLO）")
@@ -797,8 +1139,19 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
     img_h, img_w = sample_img.shape[:2]
     log(f"帧尺寸: {img_w}x{img_h}")
 
-    # COCO 类别
-    BALL_CLASS = 32  # sports ball
+    # 根据模型类别自动判断球体 class ID
+    if _using_basketball_model:
+        BALL_CLASS = None
+        for cls_id, name in model.names.items():
+            if name.lower() in ("basketball", "ball", "sports ball"):
+                BALL_CLASS = cls_id
+                break
+        if BALL_CLASS is None:
+            log("警告: 篮球专用模型中未找到 basketball/ball 类别，回退到 class 0")
+            BALL_CLASS = 0
+        log(f"球体类别: class {BALL_CLASS} ({model.names.get(BALL_CLASS, '?')})")
+    else:
+        BALL_CLASS = 32  # COCO sports ball
 
     # ================================================================
     # 通道 1: YOLO 球体检测（阶段1使用粗扫帧，阶段2精扫候选区间）
@@ -821,7 +1174,7 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
                 log(f"检测进度: {i+1}/{len(frame_files)}")
 
             try:
-                results = model(frame_path, conf=ball_yolo_conf, verbose=False)
+                results = model(frame_path, conf=ball_yolo_conf, imgsz=640, verbose=False)
                 for r in results:
                     if r.boxes is None:
                         continue
@@ -856,21 +1209,40 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
         f"cx={hoop_cx:.0f}, cy={hoop_cy:.0f}, w={hoop_w:.0f}, h={hoop_h:.0f}")
     log(f"篮筐 Y 范围: {hoop_y_min:.0f} ~ {hoop_y_max:.0f}")
 
+    # ---- 球体检测覆盖率评估 ----
+    ball_coverage = len(ball_detections) / max(1, len(frame_files))
+    ch1a_healthy = ball_coverage >= 0.10  # 通道1a是否有效工作
+    log(f"球体检测覆盖率: {ball_coverage:.1%} ({len(ball_detections)}/{len(frame_files)}) "
+        f"→ 通道1a {'正常' if ch1a_healthy else '失效（弱通道模式）'}")
+
     # 所有通道的候选事件收集
     all_candidate_events = []
 
-    # ---- 通道 1a: IOU 追踪 + 几何判定 ----
+    # ---- 通道 1a: 追踪 + 几何判定 ----
     if ball_detections and ch_enabled("1a"):
-        log("--- 通道 1a: IOU 追踪 + 几何判定 ---")
-        from tracker import IOUTracker, Detection as TrackerDetection
+        # v2.6: 根据配置选择追踪器（Kalman 或 IOU）
+        use_kalman = profile.detection_overrides.get("tracker", "iou") == "kalman"
+        tracker_name = "Kalman" if use_kalman else "IOU"
+        log(f"--- 通道 1a: {tracker_name} 追踪 + 几何判定 ---")
+
+        from tracker import IOUTracker, KalmanTracker, Detection as TrackerDetection
 
         max_lost = max(3, int(sample_fps * 1.5))
         dist_threshold = max(50, min(img_w, img_h) * 0.15)
-        tracker = IOUTracker(
-            iou_threshold=0.15,
-            max_lost=max_lost,
-            distance_threshold=dist_threshold,
-        )
+        if use_kalman:
+            tracker = KalmanTracker(
+                iou_threshold=0.15,
+                max_lost=max_lost,
+                distance_threshold=dist_threshold,
+                sample_fps=sample_fps,
+                gravity_scale=profile.detection_overrides.get("gravity_scale", 2.0),
+            )
+        else:
+            tracker = IOUTracker(
+                iou_threshold=0.15,
+                max_lost=max_lost,
+                distance_threshold=dist_threshold,
+            )
 
         frame_dets = {}
         frame_balls = {}
@@ -916,7 +1288,7 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
             heuristic_events = fallback_heuristic_v2(
                 frame_balls, img_w, img_h, total_frames,
                 sample_fps, video_duration, hoop_y_min, hoop_y_max,
-                confidence_threshold
+                confidence_threshold, hoop_cx=hoop_cx, hoop_cy=hoop_cy
             )
             all_candidate_events.extend(heuristic_events)
             log(f"通道1b 启发式: {len(heuristic_events)} 个候选")
@@ -937,7 +1309,7 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
             for frame_path in extra_frames:
                 i = frame_path_to_idx.get(frame_path, 0)
                 try:
-                    results = model(frame_path, conf=ball_yolo_conf, verbose=False)
+                    results = model(frame_path, conf=ball_yolo_conf, imgsz=640, verbose=False)
                     for r in results:
                         if r.boxes is None:
                             continue
@@ -979,14 +1351,38 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
                     if event:
                         all_candidate_events.append(event)
 
+                # 精扫后用完整 frame_balls 重新运行启发式（O-24）
+                # 粗扫跳帧可能导致方法2（球快速下落）遗漏——
+                # 例如帧200有球、帧201有球但被粗扫跳过，方法2的连续帧条件不满足
+                if ch_enabled("1b") and frame_balls2:
+                    log("  精扫后重新运行启发式检测...")
+                    heuristic_events2 = fallback_heuristic_v2(
+                        frame_balls2, img_w, img_h, len(frame_files),
+                        sample_fps, video_duration, hoop_y_min, hoop_y_max,
+                        confidence_threshold, hoop_cx=hoop_cx, hoop_cy=hoop_cy
+                    )
+                    # 与粗扫启发式去重：±1s 内不重复添加
+                    existing_times = {e["timestamp"] for e in all_candidate_events
+                                      if "启发式" in e.get("detail", "")}
+                    new_heuristic = []
+                    for he in heuristic_events2:
+                        is_dup = any(abs(he["timestamp"] - et) < 1.0
+                                     for et in existing_times)
+                        if not is_dup:
+                            new_heuristic.append(he)
+                    if new_heuristic:
+                        all_candidate_events.extend(new_heuristic)
+                        log(f"  精扫启发式新增: {len(new_heuristic)} 个候选")
+
     # ================================================================
     # 通道 2: 人体运动模式检测（不依赖球体）
     # ================================================================
     if ch_enabled("2"):
         log("--- 通道 2: 人体运动模式检测 ---")
-        # 两阶段时用粗扫帧做人体检测（速度优先）
+        # 通道2 始终使用全量帧：人体运动检测依赖连续帧的位移变化，
+        # 降帧会破坏运动连续性，导致上升帧计数不足从而漏检
         person_events = detect_goals_by_person_motion(
-            rough_frames if two_stage else frame_files,
+            frame_files,
             model, img_w, img_h, sample_fps, yolo_confidence
         )
         all_candidate_events.extend(person_events)
@@ -1016,24 +1412,42 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
         fine_frame_files = frame_files
 
     # ================================================================
-    # 通道 4: 篮网形变检测（光流法）
+    # 通道 4: 篮网有向光流穿越检测（T-1.9.13 算法C，替代旧版平均幅度）
     # ================================================================
     if enable_net_deform and ch_enabled("4"):
-        log("--- 通道 4: 篮网形变检测 ---")
+        log("--- 通道 4: 篮网有向光流穿越检测 (算法C) ---")
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from net_deform import detect_net_deformation
-            net_events = detect_net_deformation(
+            from net_deform import detect_downward_flow_through_net
+
+            # T-1.9.14: 篮网ROI高度系数从默认0.8优化（保持紧凑，减少噪声）
+            net_events = detect_downward_flow_through_net(
                 fine_frame_files, hoop_cx, hoop_cy, hoop_w,
                 sample_fps=sample_fps,
+                net_height_ratio=0.8,   # 紧凑ROI，减少无关区域噪声
+                min_burst_ratio=2.0,    # 下行光流突发阈值
+                min_purity=1.5,         # 方向纯净度：下行需是横向的1.5倍
                 cooldown_s=3.0,
             )
             all_candidate_events.extend(net_events)
-            log(f"通道4 篮网形变: {len(net_events)} 个候选")
+            log(f"通道4 有向光流穿越: {len(net_events)} 个候选")
         except Exception as e:
-            log(f"通道4 篮网形变检测失败（跳过）: {e}")
+            log(f"通道4 有向光流穿越检测失败（跳过）: {e}")
+            # 降级到旧版平均幅度检测
+            try:
+                from net_deform import detect_net_deformation
+                log("通道4 降级: 回退到旧版平均幅度检测")
+                net_events = detect_net_deformation(
+                    fine_frame_files, hoop_cx, hoop_cy, hoop_w,
+                    sample_fps=sample_fps,
+                    cooldown_s=3.0,
+                )
+                all_candidate_events.extend(net_events)
+                log(f"通道4 旧版形变: {len(net_events)} 个候选")
+            except Exception as e2:
+                log(f"通道4 旧版也失败（跳过）: {e2}")
     else:
-        log("--- 通道 4: 篮网形变检测 (已禁用，传 --enable-net-deform 启用) ---")
+        log("--- 通道 4: 篮网有向光流穿越检测 (已禁用，传 --enable-net-deform 启用) ---")
 
     # ================================================================
     # 通道 5: 音频事件检测（入网声 + 哨声）
@@ -1052,48 +1466,718 @@ def detect_goals(frames_dir, output_path, sample_fps, confidence_threshold,
         log("--- 通道 5: 音频检测 (未提供音频文件，传 --audio-file 启用) ---")
 
     # ================================================================
+    # 通道 6: ROI 多帧分类器（需要预训练 ONNX 模型）
+    # ================================================================
+    if ch_enabled("6"):
+        log("--- 通道 6: ROI 多帧分类器 ---")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from roi_classifier import detect_goals_by_roi_classifier
+            roi_events = detect_goals_by_roi_classifier(
+                fine_frame_files if two_stage else frame_files,
+                hoop_cx, hoop_cy, hoop_w,
+                sample_fps,
+                confidence_cap=profile.get_cap("6"),
+            )
+            all_candidate_events.extend(roi_events)
+            log(f"通道6 ROI分类器: {len(roi_events)} 个候选")
+        except Exception as e:
+            log(f"通道6 ROI分类器失败（跳过）: {e}")
+    else:
+        log("--- 通道 6: ROI 多帧分类器 (已禁用) ---")
+
+    # ================================================================
+    # 通道 7: 庆祝动作检测（对已有候选做确认，不独立产生事件）
+    # ================================================================
+    if ch_enabled("7") and all_candidate_events and ball_detections:
+        log("--- 通道 7: 庆祝动作检测 ---")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from celebration_detect import evaluate_celebration
+
+            # 整理 YOLO 人体检测结果（按帧索引分组）
+            person_by_frame = {}
+            for det in ball_detections:
+                # ball_detections 只有球，需要从 YOLO 结果中获取人体
+                pass
+
+            # 从 YOLO 模型重新获取人体检测（复用已加载的模型）
+            if model is not None:
+                _frames_for_person = frame_files[:min(len(frame_files), 300)]
+                for fidx, fpath in enumerate(_frames_for_person):
+                    try:
+                        results = model(fpath, verbose=False, conf=0.3, imgsz=640)
+                        for r in results:
+                            for box in r.boxes:
+                                cls_id = int(box.cls[0])
+                                if cls_id == 0:  # COCO person class
+                                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                    cx_p = (x1 + x2) / 2
+                                    cy_p = (y1 + y2) / 2
+                                    w_p = x2 - x1
+                                    h_p = y2 - y1
+                                    if fidx not in person_by_frame:
+                                        person_by_frame[fidx] = []
+                                    person_by_frame[fidx].append((cx_p, cy_p, w_p, h_p))
+                    except Exception:
+                        pass
+
+            if person_by_frame:
+                celeb_events = evaluate_celebration(
+                    person_by_frame, all_candidate_events, sample_fps
+                )
+                all_candidate_events.extend(celeb_events)
+                log(f"通道7 庆祝动作: {len(celeb_events)} 个确认事件")
+            else:
+                log("通道7 庆祝动作: 无人体检测数据，跳过")
+        except Exception as e:
+            log(f"通道7 庆祝动作检测失败（跳过）: {e}")
+    else:
+        log("--- 通道 7: 庆祝动作检测 (已禁用或无候选事件) ---")
+
+    # ================================================================
     # 汇总所有通道结果 + 跨通道验证
     # ================================================================
     log(f"所有通道汇总: {len(all_candidate_events)} 个候选事件")
 
-    if not all_candidate_events:
+    vlm_mode = profile.vlm.get("mode", "fallback")
+    if not all_candidate_events and vlm_mode != "only":
         log("所有通道均未检测到进球事件")
         save_results([], output_path)
         return
 
-    # 跨通道验证：在 ±2s 窗口内有多个通道命中的事件提升置信度
-    validation_window = 2.0  # 秒
+    # 跨通道验证：仅当 ±2s 窗口内有 >=1 个【不同类型通道】命中时才提升置信度
+    # 单通道事件保持原始置信度，避免弱信号通道（如通道3）被误提升
+    def _channel_type(detail: str) -> str:
+        """提取通道类型（去掉括号中的 left/right 等方向信息）"""
+        src = detail.split(":")[0].strip()
+        # "人体运动(left)" → "人体运动", "运动突变(left_hoop)" → "运动突变"
+        paren_idx = src.find("(")
+        if paren_idx > 0:
+            src = src[:paren_idx]
+        return src
+
+    # 弱通道置信度上限：从 AlgorithmProfile 动态生成
+    # v2.6: 通过 profile.build_weak_channel_caps() 从配置中读取
+    # 向后兼容：未传 profile 时使用默认值（与 v2.5 一致）
+    WEAK_CHANNEL_CAPS = profile.build_weak_channel_caps()
+    log(f"  通道置信度上限: {WEAK_CHANNEL_CAPS}")
+
+    cv_cfg = profile.cross_validation
+    validation_window = cv_cfg.get("window", 2.0)
+    boost_per_ch = cv_cfg.get("boost_per_channel", 0.08)
+    max_boost = cv_cfg.get("max_boost", 0.15)
+
     for i, event in enumerate(all_candidate_events):
         t = event["timestamp"]
-        # 统计其他事件中在时间窗口内的数量（不同来源）
-        nearby_count = 0
+        this_type = _channel_type(event["detail"])
+        # 收集时间窗口内不同通道来源的集合
+        nearby_types = set()
         for j, other in enumerate(all_candidate_events):
             if i == j:
                 continue
             if abs(other["timestamp"] - t) <= validation_window:
-                # 检查是否来自不同检测通道
-                this_src = event["detail"].split(":")[0].strip()
-                other_src = other["detail"].split(":")[0].strip()
-                if this_src != other_src:
-                    nearby_count += 1
-        if nearby_count > 0:
-            boost = min(0.15, nearby_count * 0.08)
+                other_type = _channel_type(other["detail"])
+                if other_type != this_type:
+                    nearby_types.add(other_type)
+        # 仅当有不同类型通道互证时才 boost
+        if len(nearby_types) >= 1:
+            boost = min(max_boost, len(nearby_types) * boost_per_ch)
             old_conf = event["confidence"]
+            cap = WEAK_CHANNEL_CAPS.get(this_type, 0.95)
             event["confidence"] = round(
-                min(0.95, event["confidence"] + boost), 3)
+                min(cap, event["confidence"] + boost), 3)
             log(f"  跨通道验证: {t:.1f}s conf {old_conf} → "
-                f"{event['confidence']} (nearby={nearby_count})")
+                f"{event['confidence']} (互证通道={nearby_types})")
+        else:
+            log(f"  单通道无互证: {t:.1f}s conf={event['confidence']:.3f} "
+                f"来源={this_type}, 不做boost")
 
-    # ---- 事件合并 + 冷静期 ----
-    events = merge_events_with_cooldown(
-        all_candidate_events, confidence_threshold,
-        merge_window=3.0, cooldown=2.0
-    )
+    # ================================================================
+    # v2.9: 强制通道 cap — 确保弱通道事件的 conf 不超过上限
+    # 跨通道互证只对有互证的事件做 cap，单通道事件可能绕过。
+    # 此处对所有事件按 WEAK_CHANNEL_CAPS 做一次强制 cap。
+    # 注意：因果链验证可以在 cap 后继续提升 conf（如强因果链 +0.12）
+    # ================================================================
+    for event in all_candidate_events:
+        this_type = _channel_type(event["detail"])
+        cap = WEAK_CHANNEL_CAPS.get(this_type, 0.95)
+        if event["confidence"] > cap:
+            old_conf = event["confidence"]
+            event["confidence"] = round(cap, 3)
+            log(f"  强制cap: {event['timestamp']:.1f}s conf {old_conf} → "
+                f"{event['confidence']} (通道={this_type}, cap={cap})")
+
+    # ================================================================
+    # v2.7: 因果推理链验证（O-23 算法E）
+    # 在跨通道互证之后、事件合并之前，检查每个候选事件的时序因果完整性。
+    # 真进球：前有投篮动作/球体飞行，后有入网声/欢呼/庆祝 → boost
+    # 孤立噪声：前后无因果信号 → 惩罚
+    # ================================================================
+    try:
+        from causal_chain import apply_causal_validation
+        log("--- 因果推理链验证 (O-23) ---")
+        apply_causal_validation(
+            all_candidate_events, video_duration, profile
+        )
+    except ImportError:
+        log("因果推理链模块未找到（causal_chain.py），跳过")
+    except Exception as e:
+        log(f"因果推理链验证失败（跳过）: {e}")
+
+    # ---- v2.6: 自适应融合策略（支持 VLM always / only 模式）----
+    vlm_mode = profile.vlm.get("mode", "fallback")
+    vlm_enabled = vlm_confirm and source_video
+    use_vlm_only = vlm_enabled and vlm_mode == "only"
+    use_vlm_always = vlm_enabled and vlm_mode == "always"
+    use_vlm_fallback = vlm_enabled and vlm_mode == "fallback" and not ch1a_healthy
+
+    if use_vlm_only:
+        # 纯 VLM 模式：忽略所有通道结果，直接用 VLM 滑动窗口扫描全视频
+        scan_window = profile.vlm.get("scan_window", 6.0)
+        scan_step = profile.vlm.get("scan_step", 3.0)
+        scan_frames = profile.vlm.get("scan_frames", 8)
+        log(f"--- 纯 VLM 模式: 滑动窗口扫描全视频 "
+            f"(窗口={scan_window}s, 步长={scan_step}s, 帧数={scan_frames}) ---")
+        events = vlm_scan_video(
+            source_video, video_duration,
+            window_seconds=scan_window,
+            step_seconds=scan_step,
+            num_frames=scan_frames,
+        )
+        log(f"VLM 扫描完成: {len(events)} 个进球事件")
+
+    elif use_vlm_always:
+        # VLM 常态过滤模式：对指定置信度范围内的候选事件做 VLM 确认
+        vlm_range = profile.vlm.get("confirm_range", [0.35, 0.70])
+        log(f"--- VLM 常态过滤模式: 确认置信度 [{vlm_range[0]}, {vlm_range[1]}) 的候选 ---")
+        merged = merge_events_with_cooldown(
+            all_candidate_events, min(confidence_threshold, vlm_range[0]),
+            merge_window=3.0, cooldown=2.0
+        )
+        log(f"合并后 {len(merged)} 个候选事件（含低置信度）")
+
+        # 高置信度直接保留，中间段走 VLM 确认
+        final_events = []
+        vlm_candidates = []
+        for e in merged:
+            if e["confidence"] >= vlm_range[1]:
+                final_events.append(e)
+            elif e["confidence"] >= vlm_range[0]:
+                vlm_candidates.append(e)
+
+        if vlm_candidates:
+            log(f"VLM 确认 {len(vlm_candidates)} 个候选事件...")
+            confirmed = vlm_confirm_events(vlm_candidates, source_video)
+            final_events.extend(confirmed)
+
+        final_events.sort(key=lambda x: x["timestamp"])
+        events = [e for e in final_events
+                  if e["confidence"] >= confidence_threshold]
+
+    elif use_vlm_fallback:
+        # 通道1a失效 + VLM回退模式
+        log("--- 自适应融合: 通道1a失效，启用VLM混合策略 ---")
+        merged = merge_events_with_cooldown(
+            all_candidate_events, confidence_threshold,
+            merge_window=3.0, cooldown=2.0
+        )
+        log(f"合并后 {len(merged)} 个候选事件")
+
+        log("步骤1: VLM逐事件确认...")
+        confirmed = vlm_confirm_events(merged, source_video)
+
+        log("步骤2: VLM独立扫描补充漏检...")
+        scan_goals = vlm_scan_video(source_video, video_duration)
+
+        events = vlm_merge_confirmed_and_scanned(
+            confirmed, scan_goals, match_tolerance=5.0
+        )
+    elif not ch1a_healthy:
+        log("--- 自适应融合: 通道1a失效，VLM未启用，标准合并（降级模式） ---")
+        events = merge_events_with_cooldown(
+            all_candidate_events, confidence_threshold,
+            merge_window=3.0, cooldown=2.0
+        )
+    else:
+        events = merge_events_with_cooldown(
+            all_candidate_events, confidence_threshold,
+            merge_window=3.0, cooldown=2.0
+        )
 
     log(f"最终结果: {len(events)} 个进球事件")
     for e in events:
-        log(f"  {e['timestamp']}s conf={e['confidence']} {e['detail']}")
+        goal_type = e.get('goal_type', '')
+        type_tag = f" [{goal_type}]" if goal_type else ""
+        log(f"  {e['timestamp']}s conf={e['confidence']}{type_tag} {e['detail']}")
     save_results(events, output_path)
+
+
+# ============================================================
+# VLM 配置读取（v2.6）
+# ============================================================
+
+# 模块级变量：存储从配置文件传入的 VLM 凭证
+_vlm_config = {}
+
+
+def _resolve_vlm_config() -> Tuple[str, str, str]:
+    """读取 VLM 凭证，配置文件优先，环境变量回退。
+
+    配置来源（按优先级）：
+    1. AlgorithmProfile 中的 vlm 段（方案级覆盖）
+    2. configs/config.yaml 顶层 vlm 段（全局共享）
+    3. 环境变量 VLM_PROVIDER / VLM_API_KEY / VLM_MODEL（回退）
+
+    Returns:
+        (provider, api_key, model)
+    """
+    provider = (_vlm_config.get("provider") or
+                os.environ.get("VLM_PROVIDER") or "dashscope").lower()
+    api_key = (_vlm_config.get("api_key") or
+               os.environ.get("VLM_API_KEY") or "")
+    model = (_vlm_config.get("model") or
+             os.environ.get("VLM_MODEL") or "")
+
+    if not model:
+        defaults = {
+            "openai": "gpt-4o",
+            "gemini": "gemini-1.5-pro",
+            "ollama": "llava:13b",
+            "dashscope": "qwen-vl-max",
+        }
+        model = defaults.get(provider, "gpt-4o")
+
+    return provider, api_key, model
+
+
+# ============================================================
+# VLM 逐事件确认（v2.4）
+# ============================================================
+
+def vlm_confirm_events(candidate_events: List[Dict],
+                       source_video: str,
+                       window_before: float = 3.0,
+                       window_after: float = 3.0,
+                       num_frames: int = 8,
+                       vlm_conf_threshold: float = 0.5) -> List[Dict]:
+    """
+    使用VLM对每个候选事件进行独立确认。
+    
+    对每个事件取 [timestamp - window_before, timestamp + window_after] 区间，
+    采样 num_frames 帧送给VLM判断是否为进球。
+    只保留VLM确认为进球的事件。
+    
+    Returns:
+        过滤后的事件列表
+    """
+    import subprocess
+    import tempfile
+    import base64
+    import time
+
+    provider, api_key, model = _resolve_vlm_config()
+
+    if not api_key:
+        log("  [warn] VLM API Key 未设置（配置文件和环境变量均为空），跳过VLM确认")
+        return candidate_events
+
+    log(f"  VLM确认: provider={provider}, model={model}, "
+        f"events={len(candidate_events)}")
+
+    # VLM确认prompt — 针对单个候选事件的精确判定
+    confirm_prompt = """你是一位专业的篮球视频审查员。以下是从一段篮球比赛视频中按时间顺序截取的连续帧画面（约6秒）。
+
+请仔细观察这组画面，判断其中是否发生了"篮球进球"事件。
+
+**进球的定义**：篮球从篮筐上方穿过篮网落下。包括：
+- 投篮命中（jumper / three-pointer）
+- 上篮命中（layup）
+- 扣篮命中（dunk）
+
+**不算进球的情况**：
+- 球碰到篮筐/篮板但弹出
+- 球员运球经过篮筐附近
+- 球停在篮筐边缘但未穿过
+- 球员做出投篮动作但球未进筐
+- 快攻跑动、防守动作等非得分场景
+
+请以严格的 JSON 格式回答（不要添加 markdown 代码块标记）:
+{
+  "is_goal": true或false,
+  "confidence": 0.0到1.0之间的浮点数（你对判断的确信程度，不确定时给低值）,
+  "reasoning": "用1-2句话简述你观察到的关键画面证据"
+}"""
+
+    confirmed = []
+    
+    for idx, event in enumerate(candidate_events):
+        ts = event["timestamp"]
+        start = max(0, ts - window_before)
+        end = ts + window_after
+        
+        log(f"  VLM确认 [{idx+1}/{len(candidate_events)}] "
+            f"t={ts:.1f}s ({event['detail'][:40]})")
+        
+        # 采样帧
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frame_paths = _sample_frames_from_video(
+                source_video, start, end, tmpdir, num_frames
+            )
+            
+            if len(frame_paths) < 3:
+                log(f"    帧采样不足({len(frame_paths)}帧)，保留事件")
+                confirmed.append(event)
+                continue
+            
+            # 调用VLM
+            try:
+                judgment = _call_vlm(
+                    provider, model, api_key, frame_paths, confirm_prompt
+                )
+            except Exception as e:
+                log(f"    VLM调用失败: {e}，保留事件")
+                confirmed.append(event)
+                continue
+            
+            is_goal = judgment.get("is_goal", False)
+            vlm_conf = judgment.get("confidence", 0.0)
+            reasoning = judgment.get("reasoning", "")
+            
+            if is_goal and vlm_conf >= vlm_conf_threshold:
+                confirmed.append(event)
+                log(f"    ✓ VLM确认进球 (conf={vlm_conf:.2f}): {reasoning[:60]}")
+            else:
+                log(f"    ✗ VLM否决 (is_goal={is_goal}, conf={vlm_conf:.2f}): "
+                    f"{reasoning[:60]}")
+        
+        # Rate limiting
+        if provider == "dashscope":
+            time.sleep(1.0)
+        elif provider == "gemini":
+            time.sleep(5.0)
+        else:
+            time.sleep(0.5)
+    
+    log(f"  VLM确认结果: {len(confirmed)}/{len(candidate_events)} 个事件通过")
+    return confirmed
+
+
+def vlm_scan_video(source_video: str, video_duration: float,
+                   window_seconds: float = 6.0, step_seconds: float = 3.0,
+                   num_frames: int = 8,
+                   goal_confidence_threshold: float = 0.5,
+                   merge_window: float = 4.0) -> List[Dict]:
+    """
+    VLM独立扫描全视频，找出所有进球时间点。
+    
+    用滑动窗口逐段扫描，每个窗口采样帧让VLM判断是否有进球。
+    """
+    import tempfile
+    import time
+    
+    provider, api_key, model = _resolve_vlm_config()
+
+    if not api_key:
+        log("  [warn] VLM API Key 未设置（配置文件和环境变量均为空），跳过VLM扫描")
+        return []
+    
+    scan_prompt = (
+        "你是一位专业的篮球视频审查员。以下是从一段篮球比赛视频中按时间顺序截取的"
+        "连续帧画面（时间跨度约 {ws} 秒）。\n\n"
+        "请仔细观察这组画面，判断其中是否发生了「篮球进球」事件。\n\n"
+        "**进球的定义**：篮球从篮筐上方穿过篮网落下。包括：\n"
+        "- 投篮命中（jumper / three-pointer）\n"
+        "- 上篮命中（layup）\n"
+        "- 扣篮命中（dunk）\n\n"
+        "**不算进球的情况**：\n"
+        "- 球碰到篮筐/篮板但弹出\n"
+        "- 球员运球经过篮筐附近\n"
+        "- 球停在篮筐边缘但未穿过\n"
+        "- 球员做出投篮动作但球未进筐\n"
+        "- 快攻跑动、防守动作等非得分场景\n\n"
+        "注意：一个窗口内可能包含 0 个或 1 个进球，不会有多个。\n"
+        "请以严格的 JSON 格式回答（不要添加 markdown 代码块标记）:\n"
+        '{{\n'
+        '  "is_goal": true或false,\n'
+        '  "confidence": 0.0到1.0之间的浮点数,\n'
+        '  "reasoning": "用1-2句话简述你观察到的关键画面证据",\n'
+        '  "goal_frame_index": null或0到N的整数\n'
+        '}}'
+    ).format(ws=window_seconds)
+    
+    # 获取视频时长
+    if video_duration <= 0:
+        import subprocess
+        try:
+            cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+                   "-show_format", source_video]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=10)
+            info = json.loads(proc.stdout.decode("utf-8"))
+            video_duration = float(info.get("format", {}).get("duration", 0))
+        except Exception:
+            video_duration = 300.0
+    
+    log(f"  VLM扫描: 窗口={window_seconds}s 步长={step_seconds}s "
+        f"视频={video_duration:.0f}s")
+    
+    # 滑动窗口扫描
+    raw_goals = []
+    t = 0.0
+    total_windows = int((video_duration - window_seconds) / step_seconds) + 1
+    win_idx = 0
+    
+    while t + window_seconds <= video_duration + 0.1:
+        win_idx += 1
+        win_start = t
+        win_end = min(t + window_seconds, video_duration)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frames = _sample_frames_from_video(
+                source_video, win_start, win_end, tmpdir, num_frames
+            )
+            
+            if len(frames) < 3:
+                t += step_seconds
+                continue
+            
+            try:
+                result = _call_vlm(provider, model, api_key, frames, scan_prompt)
+            except Exception as e:
+                log(f"    窗口 {win_start:.0f}-{win_end:.0f}s VLM失败: {e}")
+                t += step_seconds
+                continue
+            
+            is_goal = result.get("is_goal", False)
+            conf = result.get("confidence", 0.0)
+            
+            if is_goal and conf >= goal_confidence_threshold:
+                # 计算进球时间戳
+                gfi = result.get("goal_frame_index")
+                if gfi is not None and isinstance(gfi, (int, float)):
+                    goal_ts = win_start + (win_end - win_start) * gfi / max(1, num_frames - 1)
+                else:
+                    goal_ts = (win_start + win_end) / 2
+                
+                raw_goals.append({
+                    "timestamp": round(goal_ts, 2),
+                    "confidence": conf,
+                    "detail": f"VLM扫描: {result.get('reasoning', '')[:80]}",
+                    "window": [win_start, win_end]
+                })
+                log(f"    窗口 {win_start:.0f}-{win_end:.0f}s → 进球! "
+                    f"t={goal_ts:.1f}s conf={conf:.2f}")
+        
+        # Rate limiting
+        if provider == "dashscope":
+            time.sleep(1.0)
+        elif provider == "gemini":
+            time.sleep(5.0)
+        else:
+            time.sleep(0.5)
+        
+        t += step_seconds
+    
+    log(f"  VLM扫描完成: {len(raw_goals)} 个原始进球")
+    
+    # 合并相邻窗口的重复检测
+    if not raw_goals:
+        return []
+    
+    raw_goals.sort(key=lambda g: g["timestamp"])
+    merged = [raw_goals[0]]
+    for g in raw_goals[1:]:
+        if g["timestamp"] - merged[-1]["timestamp"] < merge_window:
+            if g["confidence"] > merged[-1]["confidence"]:
+                merged[-1] = g
+        else:
+            merged.append(g)
+    
+    log(f"  VLM扫描合并后: {len(merged)} 个进球")
+    for g in merged:
+        log(f"    {g['timestamp']:.1f}s conf={g['confidence']:.2f}")
+    
+    return merged
+
+
+def vlm_merge_confirmed_and_scanned(confirmed_events: List[Dict],
+                                     scanned_goals: List[Dict],
+                                     match_tolerance: float = 5.0) -> List[Dict]:
+    """
+    合并VLM确认的算法事件与VLM扫描发现的进球。
+    
+    策略：VLM扫描发现的进球中，如果没有被确认事件覆盖的，
+    作为补充漏检加入最终结果。
+    """
+    # 找出确认事件已覆盖的VLM扫描进球
+    covered_scan = set()
+    for ce in confirmed_events:
+        for si, sg in enumerate(scanned_goals):
+            if abs(ce["timestamp"] - sg["timestamp"]) <= match_tolerance:
+                covered_scan.add(si)
+    
+    # 未覆盖的扫描进球作为补充
+    supplement = []
+    for si, sg in enumerate(scanned_goals):
+        if si not in covered_scan:
+            supplement.append(sg)
+    
+    # 合并
+    result = list(confirmed_events) + supplement
+    result.sort(key=lambda e: e["timestamp"])
+    
+    log(f"  混合合并: {len(confirmed_events)} 确认 + {len(supplement)} 补充 "
+        f"= {len(result)} 最终事件")
+    
+    return result
+
+
+def _sample_frames_from_video(video_path: str, start: float, end: float,
+                               output_dir: str, num_frames: int = 8,
+                               max_dimension: int = 768) -> List[str]:
+    """从视频指定时间区间采样帧"""
+    import subprocess
+    
+    duration = end - start
+    if duration <= 0:
+        return []
+    
+    margin = min(0.05, duration * 0.03)
+    timestamps = []
+    for i in range(num_frames):
+        t = start + margin + (duration - 2 * margin) * i / max(1, num_frames - 1)
+        timestamps.append(min(t, end - 0.01))
+    
+    frame_paths = []
+    for i, ts in enumerate(timestamps):
+        frame_path = os.path.join(output_dir, f"frame_{i:03d}.jpg")
+        scale_filter = (f"scale=min({max_dimension}\\,iw):"
+                        f"min({max_dimension}\\,ih):"
+                        f"force_original_aspect_ratio=decrease")
+        cmd = [
+            "ffmpeg",
+            "-ss", f"{ts:.3f}",
+            "-i", video_path,
+            "-vframes", "1",
+            "-vf", scale_filter,
+            "-q:v", "2",
+            "-y", "-update", "1",
+            frame_path
+        ]
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           check=True, timeout=10)
+            if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                frame_paths.append(frame_path)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+    
+    return frame_paths
+
+
+def _call_vlm(provider: str, model: str, api_key: str,
+              frame_paths: List[str], prompt: str) -> Dict:
+    """调用VLM判断进球，返回解析后的dict"""
+    import urllib.request
+    import urllib.error
+    import base64
+    
+    def encode_image(path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    
+    if provider == "dashscope":
+        url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+        content = [{"text": prompt}]
+        for fp in frame_paths:
+            b64 = encode_image(fp)
+            content.append({"image": f"data:image/jpeg;base64,{b64}"})
+        
+        payload = {
+            "model": model,
+            "input": {
+                "messages": [{"role": "user", "content": content}]
+            },
+            "parameters": {"temperature": 0.1, "max_tokens": 300}
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"), headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+        text = resp_data["output"]["choices"][0]["message"]["content"][0]["text"].strip()
+    
+    elif provider == "openai":
+        base_url = os.environ.get("VLM_BASE_URL", "https://api.openai.com/v1")
+        url = f"{base_url}/chat/completions"
+        content = [{"type": "text", "text": prompt}]
+        for fp in frame_paths:
+            b64 = encode_image(fp)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}
+            })
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 300, "temperature": 0.1
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"), headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+        text = resp_data["choices"][0]["message"]["content"].strip()
+    
+    elif provider == "gemini":
+        base_url = os.environ.get("VLM_BASE_URL",
+                                   "https://generativelanguage.googleapis.com/v1beta")
+        url = f"{base_url}/models/{model}:generateContent?key={api_key}"
+        parts = [{"text": prompt}]
+        for fp in frame_paths:
+            b64 = encode_image(fp)
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300}
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+        text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    
+    else:
+        raise ValueError(f"不支持的VLM provider: {provider}")
+    
+    # 解析JSON响应
+    cleaned = text
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json", 1)[1]
+    if "```" in cleaned:
+        cleaned = cleaned.split("```", 1)[0]
+    cleaned = cleaned.strip()
+    
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # 尝试容错解析
+        is_goal = any(kw in text.lower() for kw in
+                      ["is_goal\": true", "\"is_goal\":true", "is_goal\": true"])
+        return {"is_goal": is_goal, "confidence": 0.5,
+                "reasoning": f"[JSON解析异常] {text[:200]}"}
 
 
 # ============================================================
@@ -1157,14 +2241,34 @@ def merge_events_with_cooldown(candidate_events: List[Dict],
 
 def fallback_heuristic_v2(frame_balls, img_w, img_h, total_frames,
                           sample_fps, video_duration,
-                          hoop_y_min, hoop_y_max, conf_threshold):
+                          hoop_y_min, hoop_y_max, conf_threshold,
+                          hoop_cx=None, hoop_cy=None):
     """
     改进版启发式检测：使用动态检测的篮筐 Y 范围替代硬编码值。
+
+    v2.9 改进（Round 5）：
+    - 方法1 收紧：球在篮筐区域消失的触发条件从 ≥1 帧提高到 ≥2 帧，
+      过滤仅单帧出现的假阳性
+    - 方法3 增加 dx_min 约束：球与篮筐 X 距离必须 > img_w * 0.05，
+      排除篮筐正上方极近处的篮筐/篮网误检
+
+    v2.8 改进：
+    - 方法1&2 增加 X 坐标约束：球的 X 坐标必须接近篮筐 X，
+      避免远离篮筐的球运动误触发（野球场多人场景）
+    - 新增方法3：球在篮筐上方出现后消失（投篮入筐模式），
+      解决上篮/近距离投篮时 YOLO 无法追踪球穿筐的问题
     """
     log("使用改进版启发式检测")
 
     if not frame_balls:
         return []
+
+    # X 坐标约束：球的 X 必须在篮筐 X ± margin 范围内
+    # 默认 margin = 画面宽度的 20%（约 384px for 1920）
+    x_margin = img_w * 0.20
+    # 方法3 的参数
+    y_above_min = (hoop_cy - img_h * 0.25) if hoop_cy else 0
+    y_above_max = (hoop_cy - img_h * 0.04) if hoop_cy else 0  # v2.9: 0.02→0.04，排除太靠近篮筐Y的误检
 
     candidate_events = []
     sorted_frames = sorted(frame_balls.keys())
@@ -1172,6 +2276,7 @@ def fallback_heuristic_v2(frame_balls, img_w, img_h, total_frames,
     # 方法 1：球在篮筐区域连续出现后消失
     last_ball_frame = -999
     last_ball_y = 0
+    last_ball_x = 0
     ball_in_hoop_zone_count = 0
 
     for fidx in range(total_frames):
@@ -1191,40 +2296,48 @@ def fallback_heuristic_v2(frame_balls, img_w, img_h, total_frames,
                     ball_in_hoop_zone_count = 1
 
                 if ball_in_hoop_zone_count >= 2:
-                    timestamp = fidx / sample_fps
-                    confidence = min(
-                        0.8,
-                        conf * 0.7 + 0.2 * (ball_in_hoop_zone_count / 3))
-                    candidate_events.append({
-                        "frame_index": fidx,
-                        "timestamp": round(timestamp, 2),
-                        "confidence": round(confidence, 3),
-                        "detail": (f"启发式: 球在篮筐区域连续出现"
-                                   f"{ball_in_hoop_zone_count}帧, "
-                                   f"y={cy:.0f}, conf={conf:.2f}")
-                    })
+                    # X 约束：球必须接近篮筐
+                    dx = abs(cx - hoop_cx) if hoop_cx else 0
+                    if hoop_cx is None or dx < x_margin:
+                        timestamp = fidx / sample_fps
+                        confidence = min(
+                            0.60,
+                            conf * 0.7 + 0.2 * (ball_in_hoop_zone_count / 3))
+                        candidate_events.append({
+                            "frame_index": fidx,
+                            "timestamp": round(timestamp, 2),
+                            "confidence": round(confidence, 3),
+                            "detail": (f"启发式: 球在篮筐区域连续出现"
+                                       f"{ball_in_hoop_zone_count}帧, "
+                                       f"y={cy:.0f}, conf={conf:.2f}")
+                        })
                     ball_in_hoop_zone_count = 0
 
             last_ball_frame = fidx
             last_ball_y = cy
+            last_ball_x = cx
         else:
             if last_ball_frame >= 0 and fidx - last_ball_frame == 1:
                 if (hoop_y_min <= last_ball_y <= hoop_y_max and
-                        ball_in_hoop_zone_count >= 1):
-                    timestamp = last_ball_frame / sample_fps
-                    confidence = 0.6 + 0.1 * min(ball_in_hoop_zone_count, 3)
-                    candidate_events.append({
-                        "frame_index": last_ball_frame,
-                        "timestamp": round(timestamp, 2),
-                        "confidence": round(confidence, 3),
-                        "detail": (f"启发式: 球在篮筐区域后消失, "
-                                   f"y={last_ball_y:.0f}, "
-                                   f"连续帧数={ball_in_hoop_zone_count}")
-                    })
+                        ball_in_hoop_zone_count >= 2):
+                    # X 约束
+                    dx = abs(last_ball_x - hoop_cx) if hoop_cx else 0
+                    if hoop_cx is None or dx < x_margin:
+                        timestamp = last_ball_frame / sample_fps
+                        confidence = min(0.60, 0.5 + 0.1 * min(ball_in_hoop_zone_count, 3))
+                        candidate_events.append({
+                            "frame_index": last_ball_frame,
+                            "timestamp": round(timestamp, 2),
+                            "confidence": round(confidence, 3),
+                            "detail": (f"启发式: 球在篮筐区域后消失, "
+                                       f"y={last_ball_y:.0f}, "
+                                       f"连续帧数={ball_in_hoop_zone_count}")
+                        })
             ball_in_hoop_zone_count = 0
 
-    # 方法 2：球快速下落穿过篮筐区域
+    # 方法 2：球快速下落穿过篮筐区域（增加 X 约束）
     prev_cy = None
+    prev_cx = None
     prev_fidx = -999
     for fidx in sorted_frames:
         balls = frame_balls[fidx]
@@ -1234,19 +2347,67 @@ def fallback_heuristic_v2(frame_balls, img_w, img_h, total_frames,
         if prev_cy is not None and fidx - prev_fidx <= 2:
             dy = cy - prev_cy
             if dy > img_h * 0.08 and hoop_y_min <= prev_cy <= hoop_y_max:
-                timestamp = fidx / sample_fps
-                speed_factor = min(1.0, abs(dy) / (img_h * 0.15))
-                confidence = 0.5 + 0.3 * speed_factor
-                candidate_events.append({
-                    "frame_index": fidx,
-                    "timestamp": round(timestamp, 2),
-                    "confidence": round(confidence, 3),
-                    "detail": (f"启发式: 球快速下落穿过篮筐区域, "
-                               f"dy={dy:.0f}, prev_y={prev_cy:.0f}")
-                })
+                # X 约束：prev_cx 必须接近篮筐
+                dx = abs(prev_cx - hoop_cx) if hoop_cx else 0
+                if hoop_cx is None or dx < x_margin:
+                    timestamp = fidx / sample_fps
+                    speed_factor = min(1.0, abs(dy) / (img_h * 0.15))
+                    confidence = min(0.60, 0.4 + 0.2 * speed_factor)
+                    candidate_events.append({
+                        "frame_index": fidx,
+                        "timestamp": round(timestamp, 2),
+                        "confidence": round(confidence, 3),
+                        "detail": (f"启发式: 球快速下落穿过篮筐区域, "
+                                   f"dy={dy:.0f}, prev_y={prev_cy:.0f}")
+                    })
 
         prev_cy = cy
+        prev_cx = cx
         prev_fidx = fidx
+
+    # 方法 3：球在篮筐上方出现后消失（投篮入筐模式）
+    # 适用于上篮/近距离投篮：球在篮筐正上方出现（conf >= 0.25），
+    # 之后1~2帧在篮筐附近无球检测 → 球穿入篮筐消失
+    # v2.9: 增加 dx_min 约束，排除篮筐正上方极近处的篮筐/篮网误检
+    dx_min = img_w * 0.05  # 球与篮筐 X 距离最小值（约 96px for 1920w）
+    if hoop_cx is not None and hoop_cy is not None:
+        for fidx in sorted_frames:
+            balls = frame_balls[fidx]
+            for cx, cy, w, h, conf in balls:
+                # 条件1：Y 在篮筐上方合理范围（不会太远）
+                if not (y_above_min <= cy <= y_above_max):
+                    continue
+                # 条件2：X 接近篮筐（但不能太近，太近更可能是篮筐/篮网误检）
+                dx = abs(cx - hoop_cx)
+                if dx > x_margin or dx < dx_min:
+                    continue
+                # 条件3：后续1~2帧在篮筐附近无球
+                disappeared = True
+                for gap in range(1, 3):
+                    check_fidx = fidx + gap
+                    if check_fidx in frame_balls:
+                        for bcx, bcy, bw, bh, bconf in frame_balls[check_fidx]:
+                            bdx = abs(bcx - hoop_cx)
+                            bdy = abs(bcy - hoop_cy)
+                            if bdx < x_margin and bdy < img_h * 0.25:
+                                disappeared = False
+                                break
+                    if not disappeared:
+                        break
+
+                if disappeared:
+                    timestamp = fidx / sample_fps
+                    # conf 基于球的检测置信度和距篮筐的接近程度
+                    proximity_factor = max(0, 1.0 - dx / x_margin)
+                    confidence = min(0.60, 0.35 + 0.15 * proximity_factor + 0.10 * min(conf, 0.8))
+                    candidate_events.append({
+                        "frame_index": fidx,
+                        "timestamp": round(timestamp, 2),
+                        "confidence": round(confidence, 3),
+                        "detail": (f"启发式: 球在篮筐上方消失, "
+                                   f"x={cx:.0f}, y={cy:.0f}, "
+                                   f"dx={dx:.0f}")
+                    })
 
     log(f"启发式检测产生 {len(candidate_events)} 个候选事件")
     return candidate_events
@@ -1327,7 +2488,7 @@ def save_results(events, output_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GoalCut AI 进球检测引擎 v2.2")
+    parser = argparse.ArgumentParser(description="GoalCut AI 进球检测引擎 v2.7")
     parser.add_argument("--frames-dir", required=True, help="帧图片目录")
     parser.add_argument("--output", required=True, help="检测结果输出路径(JSON)")
     parser.add_argument("--sample-fps", type=float, default=3, help="采样帧率")
@@ -1344,15 +2505,48 @@ def main():
                         help="启用篮网形变检测（光流法，需要 OpenCV）")
     parser.add_argument("--two-stage", action="store_true",
                         help="启用两阶段采样（粗扫候选区间后精扫，提升时间精度）")
-    # v2.3 通道选择
+    # v2.3 通道选择（向后兼容，优先级低于 --algorithm-profile）
     parser.add_argument("--channel", default="",
-                        help="只运行指定通道（逗号分隔），如: 1a,2,5。空=全部")
+                        help="只运行指定通道（逗号分隔），如: 1a,2,5。空=全部。"
+                             "优先级低于 --algorithm-profile")
+    # v2.4 VLM确认
+    parser.add_argument("--source-video", default="",
+                        help="源视频路径（VLM确认时从中采样帧）")
+    parser.add_argument("--vlm-confirm", action="store_true",
+                        help="启用VLM逐事件确认（需设置VLM_API_KEY）")
+    # v2.6 算法配置
+    parser.add_argument("--algorithm-profile", default="",
+                        help="算法配置方案名称，从 configs/config.yaml 的 "
+                             "algorithm_profiles 中读取。"
+                             "可选: default, pickup_with_net, pickup_no_net, "
+                             "minimal, vlm_primary")
+    parser.add_argument("--algorithm-config", default="",
+                        help="独立算法配置 YAML 文件路径（优先级高于 --algorithm-profile）")
+    parser.add_argument("--list-profiles", action="store_true",
+                        help="列出所有可用的算法配置方案并退出")
 
     args = parser.parse_args()
 
-    # 解析通道过滤
+    # 列出可用方案
+    if args.list_profiles:
+        _list_available_profiles()
+        return
+
+    # 加载算法配置（优先级: --algorithm-config > --algorithm-profile > --channel > 默认）
+    profile = None
+    if args.algorithm_config:
+        profile = AlgorithmProfile.load(config_path=args.algorithm_config)
+        log(f"从文件加载算法配置: {args.algorithm_config}")
+    elif args.algorithm_profile:
+        profile = AlgorithmProfile.load(profile_name=args.algorithm_profile)
+        log(f"使用预定义算法配置: {args.algorithm_profile}")
+    elif args.channel:
+        profile = AlgorithmProfile.from_channel_filter(args.channel)
+        log(f"从 --channel 参数创建配置: {args.channel}")
+
+    # 向后兼容：未使用 profile 时走原逻辑
     enabled_channels = None
-    if args.channel:
+    if profile is None and args.channel:
         enabled_channels = set(c.strip() for c in args.channel.split(","))
         log(f"仅运行通道: {enabled_channels}")
 
@@ -1367,7 +2561,52 @@ def main():
         enable_net_deform=args.enable_net_deform,
         two_stage=args.two_stage,
         enabled_channels=enabled_channels,
+        source_video=args.source_video if args.source_video else None,
+        vlm_confirm=args.vlm_confirm,
+        algorithm_profile=profile,
     )
+
+
+def _list_available_profiles():
+    """列出所有可用的算法配置方案"""
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "configs", "config.yaml"),
+        "configs/config.yaml",
+    ]
+    for cfg_path in candidates:
+        if os.path.exists(cfg_path):
+            try:
+                import yaml
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f)
+                profiles = data.get("algorithm_profiles", {})
+                print("\n可用的算法配置方案:")
+                print("=" * 60)
+                for name, pdata in profiles.items():
+                    desc = pdata.get("description", "")
+                    channels = pdata.get("channels", {})
+                    enabled = [str(ch) for ch, cfg in channels.items()
+                               if isinstance(cfg, dict) and cfg.get("enabled", True)]
+                    disabled = [str(ch) for ch, cfg in channels.items()
+                                if isinstance(cfg, dict) and not cfg.get("enabled", True)]
+                    vlm = pdata.get("vlm", {})
+                    vlm_status = "启用" if vlm.get("enabled") else "禁用"
+
+                    print(f"\n  {name}")
+                    print(f"    描述: {desc}")
+                    print(f"    启用通道: {', '.join(str(c) for c in sorted(enabled))}")
+                    if disabled:
+                        print(f"    禁用通道: {', '.join(str(c) for c in sorted(disabled))}")
+                    print(f"    VLM: {vlm_status}")
+                print("\n" + "=" * 60)
+                print(f"使用方式: python detect.py --algorithm-profile <名称> ...")
+                print()
+            except ImportError:
+                print("错误: 需要 pyyaml (pip install pyyaml)")
+            except Exception as e:
+                print(f"错误: {e}")
+            return
+    print("未找到 configs/config.yaml")
 
 
 if __name__ == "__main__":

@@ -46,3 +46,31 @@ test/output/**/*.mp4
 
 # Logs
 *.log
+
+# VLM verification reports (auto-generated)
+test/vlm_verify/reports/
+test/annotations/auto/
+
+test/vlm_report/*.json
+
+# Local build output
+/goalcut
+
+# Extra video formats
+*.mov
+*.MOV
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# AI/ML datasets and training artifacts
+ai-engine/datasets/
+ai-engine/runs/
+ai-engine/models/
+
+# Evaluation outputs
+test/output/

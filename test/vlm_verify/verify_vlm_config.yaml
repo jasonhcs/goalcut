@@ -1,0 +1,82 @@
+# GoalCut VLM 验证器配置
+# ========================
+# 本文件定义 VLM 验证器的运行参数。
+# 所有配置项也可通过命令行参数或环境变量覆盖。
+
+# VLM 模型配置
+vlm:
+  # 模型提供商: openai / gemini / ollama / dashscope
+  # 也可通过 VLM_PROVIDER 环境变量设置
+  provider: "openai"
+
+  # 模型名称（留空则使用 provider 默认值）
+  # openai  → gpt-4o
+  # gemini  → gemini-1.5-pro
+  # ollama  → llava:13b
+  # dashscope → qwen-vl-max
+  model: ""
+
+  # API Key（建议通过 VLM_API_KEY 环境变量设置，不要写在配置文件中）
+  # api_key: ""
+
+  # 自定义 API 端点（可选，用于代理或自部署服务）
+  # 也可通过 VLM_BASE_URL 环境变量设置
+  # base_url: ""
+
+# 帧采样配置
+sampling:
+  # 每个片段采样帧数（建议 6~10，过多会增加 API 成本）
+  num_frames: 8
+
+  # 帧图片最大边长（像素），图片会等比缩放到该尺寸内
+  # 较小的值可以减少 API token 消耗，但可能丢失细节
+  max_dimension: 768
+
+# 片段裁剪配置（仅 --input 模式使用）
+clip:
+  # 进球前截取秒数（应与 goalcut 的 before_seconds 一致）
+  before_seconds: 3.0
+
+  # 进球后截取秒数（应与 goalcut 的 after_seconds 一致）
+  after_seconds: 1.0
+
+# 全视频扫描配置（--scan 模式使用）
+scan:
+  # 滑动窗口大小（秒）：每次送给 VLM 的视频片段时长
+  # 建议 5~8 秒，覆盖完整的投篮-入框过程
+  window_seconds: 6.0
+
+  # 滑动步长（秒）：相邻窗口的间隔
+  # 步长 < 窗口大小时产生重叠，减少漏检但增加 API 调用
+  # 经测试 3s 步长在 goalcut_demo_1 上实现 P=100% R=100% F1=100%
+  step_seconds: 3.0
+
+  # VLM 进球判定最低置信度：低于此值的不视为进球
+  goal_confidence_threshold: 0.5
+
+  # 去重合并窗口（秒）：相邻窗口都检测到同一个进球时合并
+  merge_window: 4.0
+
+# 负样本审查配置
+negative_check:
+  # 是否启用负样本审查（检测漏检）
+  enabled: false
+
+  # 负样本抽检数量
+  num_samples: 3
+
+# Ground Truth 匹配配置
+matching:
+  # 事件匹配容差（秒）
+  tolerance: 3.0
+
+# 判定阈值
+thresholds:
+  # VLM 置信度低于此值时不认为是进球确认
+  vlm_goal_confidence: 0.4
+
+  # 一致性率低于此值时标记为 FAIL
+  min_agreement_rate: 0.7
+
+  # FP 疑似误检率超过此值时触发告警
+  max_fp_rate: 0.2

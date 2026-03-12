@@ -188,8 +188,12 @@ def run_channel_test(
     gt_path_abs = os.path.abspath(gt_path) if gt_path else ""
     audio_file_abs = os.path.abspath(audio_file) if audio_file else ""
 
+    # 优先使用 miniconda python3.10（支持 ultralytics），回退到 sys.executable
+    _python = "/opt/miniconda3/bin/python3.10"
+    if not os.path.exists(_python):
+        _python = sys.executable
     cmd = [
-        sys.executable,
+        _python,
         os.path.join(ai_engine_dir, "channel_test.py"),
         "--frames-dir", frames_dir,
         "--video-duration", str(video_duration),

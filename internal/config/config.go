@@ -17,6 +17,7 @@ type DetectionConfig struct {
 	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
 	YOLOConfidence      float64 `yaml:"yolo_confidence"`
 	PythonPath          string  `yaml:"python_path"`
+	AlgorithmProfile    string  `yaml:"algorithm_profile"`
 }
 
 type HighlightConfig struct {
@@ -45,7 +46,7 @@ func DefaultConfig() *Config {
 		},
 		Highlight: HighlightConfig{
 			BeforeSeconds:  3,
-			AfterSeconds:   1,
+			AfterSeconds:   3,
 			MergeThreshold: 4,
 		},
 	}

@@ -94,13 +94,26 @@ func (p *Pipeline) Run(inputPath, outputPath string) error {
 
 	// 3. AI 检测进球
 	fmt.Println("\n[pipeline] === 步骤 3/5: AI 视觉检测进球 ===")
-	events, err := p.detectGoals(framesDir, frameCount, info.Duration, audioPath)
+	events, err := p.detectGoals(framesDir, frameCount, info.Duration, audioPath, inputPath)
 	if err != nil {
 		return fmt.Errorf("AI 检测失败: %w", err)
 	}
 	fmt.Printf("[pipeline] 检测到 %d 个进球事件\n", len(events))
 	for i, e := range events {
 		fmt.Printf("[pipeline]   进球 #%d: 时间=%.2fs, 置信度=%.2f, %s\n", i+1, e.Timestamp, e.Confidence, e.Detail)
+	}
+
+	// 保存检测结果到输出目录
+	{
+		baseName := filepath.Base(inputPath)
+		ext := filepath.Ext(baseName)
+		detectionName := baseName[:len(baseName)-len(ext)] + "_detection.json"
+		detectionPath := filepath.Join(filepath.Dir(outputPath), detectionName)
+		if detData, err := json.MarshalIndent(events, "", "  "); err == nil {
+			if err := os.WriteFile(detectionPath, detData, 0644); err == nil {
+				fmt.Printf("[pipeline] 检测结果已保存: %s\n", detectionPath)
+			}
+		}
 	}
 
 	if len(events) == 0 {
@@ -157,7 +170,8 @@ func (p *Pipeline) Run(inputPath, outputPath string) error {
 
 // detectGoals 调用 Python AI 脚本检测进球
 // audioPath 为空字符串时不启用音频检测通道
-func (p *Pipeline) detectGoals(framesDir string, frameCount int, duration float64, audioPath string) ([]GoalEvent, error) {
+// sourceVideo 为源视频路径，VLM 确认通道需要从中采样帧
+func (p *Pipeline) detectGoals(framesDir string, frameCount int, duration float64, audioPath string, sourceVideo string) ([]GoalEvent, error) {
 	// 获取 ai-engine 脚本路径
 	exePath, err := os.Executable()
 	if err != nil {
@@ -192,8 +206,20 @@ func (p *Pipeline) detectGoals(framesDir string, frameCount int, duration float6
 		"--two-stage",        // 默认启用两阶段采样
 		"--enable-net-deform", // 默认启用篮网形变检测
 	}
+	if p.cfg.Detection.AlgorithmProfile != "" {
+		args = append(args, "--algorithm-profile", p.cfg.Detection.AlgorithmProfile)
+		fmt.Printf("[pipeline] 算法配置: %s\n", p.cfg.Detection.AlgorithmProfile)
+	}
 	if audioPath != "" {
 		args = append(args, "--audio-file", audioPath)
+	}
+	if sourceVideo != "" {
+		absPath, err := filepath.Abs(sourceVideo)
+		if err == nil {
+			sourceVideo = absPath
+		}
+		args = append(args, "--source-video", sourceVideo)
+		fmt.Printf("[pipeline] 源视频: %s (VLM确认通道可用)\n", sourceVideo)
 	}
 
 	cmd := exec.Command(p.cfg.Detection.PythonPath, args...)

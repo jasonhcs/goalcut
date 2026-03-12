@@ -1,15 +1,16 @@
 """
-GoalCut 轻量级 IOU 追踪器
+GoalCut 目标追踪器
 
-基于 IOU（Intersection over Union）的帧间目标关联，为篮球建立跨帧轨迹。
-不依赖外部追踪库（如 ByteTrack），仅使用 numpy。
+提供两种追踪器：
+1. IOUTracker: 基于 IOU 的轻量级追踪器，线性外推预测（v2.5 默认）
+2. KalmanTracker: 基于 Kalman 滤波的物理追踪器，引入重力加速度（v2.6 新增）
 
-核心逻辑：
-1. 对每帧的检测框，计算与上一帧已有轨迹最后位置的 IOU
-2. IOU 超过阈值则关联到已有轨迹，否则创建新轨迹
-3. 轨迹连续丢失超过 max_lost 帧则终止
+KalmanTracker 优势：
+- 状态向量包含速度分量，预测更平滑
+- 引入重力加速度，预测轨迹遵循抛物线而非直线
+- 遮挡 3~8 帧后仍能可靠预测球位置
 
-输出：带 track_id 的轨迹序列，供几何进球判定使用。
+不依赖外部追踪库，仅使用 numpy。
 """
 
 import numpy as np
@@ -272,3 +273,127 @@ class IOUTracker:
             if len(t.points) >= 2:
                 all_tracks.append(t)
         return all_tracks
+
+
+# ============================================================
+# Kalman 物理追踪器（v2.6 新增）
+# ============================================================
+
+class KalmanState:
+    """单目标 Kalman 滤波状态，含重力加速度模型。
+
+    状态向量: [x, y, vx, vy]
+    观测向量: [x, y]
+    物理模型: x' = x + vx, y' = y + vy + 0.5*g, vx' = vx, vy' = vy + g
+    """
+
+    def __init__(self, cx: float, cy: float,
+                 g_per_frame: float = 0.0,
+                 process_noise: float = 5.0,
+                 measurement_noise: float = 10.0):
+        self.state = np.array([cx, cy, 0.0, 0.0], dtype=np.float64)
+        self.g = g_per_frame
+
+        # 状态协方差
+        self.P = np.eye(4, dtype=np.float64) * 100.0
+
+        # 过程噪声
+        self.Q = np.eye(4, dtype=np.float64) * process_noise ** 2
+
+        # 观测噪声
+        self.R = np.eye(2, dtype=np.float64) * measurement_noise ** 2
+
+        # 观测矩阵 H: 只观测 [x, y]
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=np.float64)
+
+    def _transition_matrix(self) -> np.ndarray:
+        """状态转移矩阵 F"""
+        return np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float64)
+
+    def predict(self) -> Tuple[float, float]:
+        """预测下一帧状态（含重力）"""
+        F = self._transition_matrix()
+        self.state = F @ self.state
+        # 施加重力：y 方向速度增加，位置额外偏移
+        self.state[3] += self.g
+        self.state[1] += 0.5 * self.g
+
+        self.P = F @ self.P @ F.T + self.Q
+        return float(self.state[0]), float(self.state[1])
+
+    def update(self, cx: float, cy: float):
+        """用观测值校正状态"""
+        z = np.array([cx, cy], dtype=np.float64)
+        y = z - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ y
+        I = np.eye(4, dtype=np.float64)
+        self.P = (I - K @ self.H) @ self.P
+
+    @property
+    def position(self) -> Tuple[float, float]:
+        return float(self.state[0]), float(self.state[1])
+
+    @property
+    def velocity(self) -> Tuple[float, float]:
+        return float(self.state[2]), float(self.state[3])
+
+
+class KalmanTrack(Track):
+    """带 Kalman 状态的轨迹"""
+
+    def __init__(self, track_id: int, g_per_frame: float = 0.0):
+        super().__init__(track_id=track_id)
+        self.kalman: Optional[KalmanState] = None
+        self.g_per_frame = g_per_frame
+
+    def predict_position(self) -> Tuple[float, float]:
+        """使用 Kalman 滤波预测（含重力），遮挡时比线性外推精确"""
+        if self.kalman is not None:
+            return self.kalman.predict()
+        return super().predict_position()
+
+    def add_point(self, det: Detection):
+        super().add_point(det)
+        if self.kalman is None:
+            self.kalman = KalmanState(det.cx, det.cy,
+                                       g_per_frame=self.g_per_frame)
+        else:
+            self.kalman.update(det.cx, det.cy)
+
+
+class KalmanTracker(IOUTracker):
+    """基于 Kalman 滤波的物理追踪器。
+
+    继承 IOUTracker 的匹配逻辑，替换轨迹预测为抛物线模型。
+
+    Args:
+        sample_fps: 采样帧率（用于计算每帧重力增量）
+        gravity_scale: 重力缩放系数（像素/帧^2），
+                       实际值取决于画面中篮球的像素大小和帧率。
+                       默认 2.0 适用于 1080p@3fps 的典型野球场视频。
+    """
+
+    def __init__(self, iou_threshold: float = 0.2, max_lost: int = 5,
+                 distance_threshold: float = 100.0,
+                 sample_fps: float = 3.0,
+                 gravity_scale: float = 2.0):
+        super().__init__(iou_threshold, max_lost, distance_threshold)
+        self.g_per_frame = gravity_scale
+
+    def _create_track(self, det: Detection) -> Track:
+        track = KalmanTrack(track_id=self.next_id,
+                             g_per_frame=self.g_per_frame)
+        self.next_id += 1
+        track.add_point(det)
+        self.active_tracks.append(track)
+        return track

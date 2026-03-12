@@ -1,0 +1,23 @@
+{
+  "video": "goalcut_demo_1.MP4",
+  "duration": 33.24,
+  "total_goals": 4,
+  "goals": [
+    {
+      "timestamp": 11.0,
+      "note": "进球1"
+    },
+    {
+      "timestamp": 17.0,
+      "note": "进球2"
+    },
+    {
+      "timestamp": 22.0,
+      "note": "进球3"
+    },
+    {
+      "timestamp": 27.0,
+      "note": "进球4"
+    }
+  ]
+}
